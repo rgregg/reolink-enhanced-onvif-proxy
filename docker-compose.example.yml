@@ -1,0 +1,7 @@
+services:
+  reolink-onvif-proxy:
+    build: .
+    volumes:
+      - ./config.yml:/config.yml:ro
+    network_mode: host
+    restart: unless-stopped

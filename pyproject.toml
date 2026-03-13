@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reolink-enhanced-onvif-proxy"
+version = "0.1.0"
+description = "ONVIF proxy that translates PTZ commands for Reolink cameras, enabling autotracking and click-to-move"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {text = "MIT"}
+dependencies = [
+    "aiohttp>=3.9",
+    "lxml>=5.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.21",
+]
+
+[project.scripts]
+reolink-onvif-proxy = "reolink_onvif_proxy.main:main"
+
+[tool.setuptools.packages.find]
+include = ["reolink_onvif_proxy*"]
