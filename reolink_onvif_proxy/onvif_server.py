@@ -342,11 +342,10 @@ class ONVIFServer:
             await self.api.ptz_control(username, password, "Stop")
 
     async def _handle_relative_move(self, body: etree._Element, username: str, password: str):
-        """Handle RelativeMove — translate to Set3DPos via ptz_translator."""
+        """Handle RelativeMove — use Set3DPos if available, otherwise position-feedback."""
         action_el = body[0]
         translation = action_el.find(f".//{{{SCHEMA_NS}}}PanTilt")
         zoom_el = action_el.find(f".//{{{SCHEMA_NS}}}Zoom")
-        speed_el = action_el.find(f".//{{{SCHEMA_NS}}}PanTilt")
 
         pan, tilt = (0.0, 0.0)
         zoom = 0.0
@@ -364,30 +363,30 @@ class ONVIFServer:
             if speed_pt is not None:
                 speed = float(speed_pt.get("x", "1.0"))
 
-        # Get stream resolution
-        resolution = await self.api.get_stream_resolution(username, password)
+        if self.api.supports_3d_pos:
+            # Use Set3DPos (atomic pan+tilt+zoom)
+            resolution = await self.api.get_stream_resolution(username, password)
+            params = relative_move_to_3d_pos(
+                pan=pan, tilt=tilt, zoom=zoom,
+                stream_width=resolution.width,
+                stream_height=resolution.height,
+                speed=speed,
+            )
+            await self.api.set_3d_pos(
+                username=username, password=password,
+                pos_x=params.pos_x, pos_y=params.pos_y,
+                pos_width=params.pos_width, pos_height=params.pos_height,
+                stream_width=params.width, stream_height=params.height,
+                speed=params.speed,
+            )
+        else:
+            # Fallback: position-feedback ContinuousMove
+            logger.debug("Camera %s: using position-feedback RelativeMove (no Set3DPos)", self.config.name)
+            await self.api.relative_move_feedback(
+                username=username, password=password,
+                pan=pan, tilt=tilt, speed=speed,
+            )
 
-        # Translate to Set3DPos
-        params = relative_move_to_3d_pos(
-            pan=pan,
-            tilt=tilt,
-            zoom=zoom,
-            stream_width=resolution.width,
-            stream_height=resolution.height,
-            speed=speed,
-        )
-
-        await self.api.set_3d_pos(
-            username=username,
-            password=password,
-            pos_x=params.pos_x,
-            pos_y=params.pos_y,
-            pos_width=params.pos_width,
-            pos_height=params.pos_height,
-            stream_width=params.width,
-            stream_height=params.height,
-            speed=params.speed,
-        )
         self.state.mark_moving()
 
     async def _handle_absolute_move(self, body: etree._Element, username: str, password: str):

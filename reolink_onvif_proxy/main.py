@@ -26,6 +26,13 @@ async def start_proxy(config_path: str):
         api = ReolinkAPI(cam.host, cam.port)
         apis.append(api)
 
+        # Probe camera capabilities if credentials are available
+        if cam.username and cam.password:
+            try:
+                await api.probe_capabilities(cam.username, cam.password)
+            except Exception as e:
+                logger.warning("Failed to probe capabilities for '%s': %s", cam.name, e)
+
         server = ONVIFServer(cam, api)
         app = server.create_app()
         runner = web.AppRunner(app)
@@ -35,11 +42,13 @@ async def start_proxy(config_path: str):
         await site.start()
 
         logger.info(
-            "Camera '%s' (%s:%d) → ONVIF proxy on port %d",
+            "Camera '%s' (%s:%d) → ONVIF proxy on port %d (Set3DPos=%s, tilt=%s)",
             cam.name,
             cam.host,
             cam.port,
             cam.listen_port,
+            api.supports_3d_pos,
+            api.has_tilt,
         )
         runners.append(runner)
 
