@@ -60,6 +60,18 @@ cameras:
 ```yaml
 services:
   reolink-onvif-proxy:
+    image: ghcr.io/rgregg/reolink-enhanced-onvif-proxy:main
+    volumes:
+      - ./config.yml:/config.yml:ro
+    network_mode: host
+    restart: unless-stopped
+```
+
+Or build from source:
+
+```yaml
+services:
+  reolink-onvif-proxy:
     build: https://github.com/rgregg/reolink-enhanced-onvif-proxy.git
     volumes:
       - ./config.yml:/config.yml:ro
