@@ -183,11 +183,12 @@ def _build_ptz_config(parent: etree._Element):
     etree.SubElement(ptz, f"{{{NS['tt']}}}Name").text = "PTZConfig"
     etree.SubElement(ptz, f"{{{NS['tt']}}}UseCount").text = "1"
     etree.SubElement(ptz, f"{{{NS['tt']}}}NodeToken").text = PTZ_NODE_TOKEN
-    etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultContinuousPanTiltVelocitySpace").text = CONTINUOUS_PT_SPACE
-    etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultContinuousZoomVelocitySpace").text = CONTINUOUS_ZOOM_SPACE
+    # Order must match XSD: Absolute, Relative, Continuous, Speed, Timeout
+    etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultAbsoluteZoomPositionSpace").text = ABSOLUTE_ZOOM_SPACE
     etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultRelativePanTiltTranslationSpace").text = RELATIVE_PT_SPACE
     etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultRelativeZoomTranslationSpace").text = RELATIVE_ZOOM_SPACE
-    etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultAbsoluteZoomPositionSpace").text = ABSOLUTE_ZOOM_SPACE
+    etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultContinuousPanTiltVelocitySpace").text = CONTINUOUS_PT_SPACE
+    etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultContinuousZoomVelocitySpace").text = CONTINUOUS_ZOOM_SPACE
     etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultPTZTimeout").text = "PT10S"
 
     default_speed = etree.SubElement(ptz, f"{{{NS['tt']}}}DefaultPTZSpeed")
