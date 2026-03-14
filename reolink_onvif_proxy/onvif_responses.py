@@ -237,11 +237,14 @@ def get_configuration_options() -> bytes:
     opts = etree.SubElement(resp, f"{{{NS['tptz']}}}PTZConfigurationOptions")
     spaces = etree.SubElement(opts, f"{{{NS['tt']}}}Spaces")
 
-    # Continuous pan/tilt velocity space
-    _range_element(spaces, "ContinuousPanTiltVelocitySpace", CONTINUOUS_PT_SPACE, -1.0, 1.0, -1.0, 1.0)
+    # Order MUST match XSD schema for zeep to parse correctly:
+    # 1. AbsolutePanTiltPositionSpace, 2. AbsoluteZoomPositionSpace,
+    # 3. RelativePanTiltTranslationSpace, 4. RelativeZoomTranslationSpace,
+    # 5. ContinuousPanTiltVelocitySpace, 6. ContinuousZoomVelocitySpace,
+    # 7. PanTiltSpeedSpace, 8. ZoomSpeedSpace
 
-    # Continuous zoom velocity space
-    _range_element(spaces, "ContinuousZoomVelocitySpace", CONTINUOUS_ZOOM_SPACE, -1.0, 1.0)
+    # Absolute zoom position space
+    _range_element(spaces, "AbsoluteZoomPositionSpace", ABSOLUTE_ZOOM_SPACE, 0.0, 1.0)
 
     # Relative pan/tilt translation spaces (generic + FOV)
     _range_element(spaces, "RelativePanTiltTranslationSpace", RELATIVE_PT_SPACE, -1.0, 1.0, -1.0, 1.0)
@@ -250,8 +253,11 @@ def get_configuration_options() -> bytes:
     # Relative zoom translation space
     _range_element(spaces, "RelativeZoomTranslationSpace", RELATIVE_ZOOM_SPACE, -1.0, 1.0)
 
-    # Absolute zoom position space
-    _range_element(spaces, "AbsoluteZoomPositionSpace", ABSOLUTE_ZOOM_SPACE, 0.0, 1.0)
+    # Continuous pan/tilt velocity space
+    _range_element(spaces, "ContinuousPanTiltVelocitySpace", CONTINUOUS_PT_SPACE, -1.0, 1.0, -1.0, 1.0)
+
+    # Continuous zoom velocity space
+    _range_element(spaces, "ContinuousZoomVelocitySpace", CONTINUOUS_ZOOM_SPACE, -1.0, 1.0)
 
     # Speed spaces
     _range_element(spaces, "PanTiltSpeedSpace", PT_SPEED_SPACE, 0.0, 1.0)
@@ -284,12 +290,13 @@ def get_nodes() -> bytes:
     etree.SubElement(node, f"{{{NS['tt']}}}Name").text = "PTZ Node"
 
     spaces = etree.SubElement(node, f"{{{NS['tt']}}}SupportedPTZSpaces")
-    _range_element(spaces, "ContinuousPanTiltVelocitySpace", CONTINUOUS_PT_SPACE, -1.0, 1.0, -1.0, 1.0)
-    _range_element(spaces, "ContinuousZoomVelocitySpace", CONTINUOUS_ZOOM_SPACE, -1.0, 1.0)
+    # Order must match XSD schema for zeep compatibility
+    _range_element(spaces, "AbsoluteZoomPositionSpace", ABSOLUTE_ZOOM_SPACE, 0.0, 1.0)
     _range_element(spaces, "RelativePanTiltTranslationSpace", RELATIVE_PT_SPACE, -1.0, 1.0, -1.0, 1.0)
     _range_element(spaces, "RelativePanTiltTranslationSpace", RELATIVE_PT_FOV_SPACE, -1.0, 1.0, -1.0, 1.0)
     _range_element(spaces, "RelativeZoomTranslationSpace", RELATIVE_ZOOM_SPACE, -1.0, 1.0)
-    _range_element(spaces, "AbsoluteZoomPositionSpace", ABSOLUTE_ZOOM_SPACE, 0.0, 1.0)
+    _range_element(spaces, "ContinuousPanTiltVelocitySpace", CONTINUOUS_PT_SPACE, -1.0, 1.0, -1.0, 1.0)
+    _range_element(spaces, "ContinuousZoomVelocitySpace", CONTINUOUS_ZOOM_SPACE, -1.0, 1.0)
     _range_element(spaces, "PanTiltSpeedSpace", PT_SPEED_SPACE, 0.0, 1.0)
     _range_element(spaces, "ZoomSpeedSpace", ZOOM_SPEED_SPACE, 0.0, 1.0)
 
