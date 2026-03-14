@@ -13,6 +13,7 @@ dependencies = [
     "aiohttp>=3.9",
     "lxml>=5.0",
     "pyyaml>=6.0",
+    "reolink-aio>=0.13",
 ]
 
 [project.optional-dependencies]

@@ -1,10 +1,10 @@
-"""Reolink HTTP API client for PTZ operations."""
+"""Reolink API client using reolink_aio (Baichuan + HTTP)."""
 
 import asyncio
 import logging
 from dataclasses import dataclass
 
-import aiohttp
+from reolink_aio.api import Host
 
 logger = logging.getLogger(__name__)
 
@@ -32,65 +32,62 @@ class StreamResolution:
 
 
 class ReolinkAPI:
-    """Client for Reolink camera HTTP API."""
+    """Client for Reolink camera using reolink_aio (Baichuan protocol)."""
 
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
-        self._session: aiohttp.ClientSession | None = None
+        self._api: Host | None = None
+        self._logged_in = False
         self._stream_resolution: StreamResolution | None = None
-        self._supports_3d_pos: bool | None = None  # None = not yet probed
-        self._has_tilt: bool | None = None  # None = not yet probed
+        self._supports_3d_pos: bool | None = None
+        self._has_tilt: bool = True  # Baichuan always returns tilt
 
-    @property
-    def base_url(self) -> str:
-        scheme = "https" if self.port == 443 else "http"
-        return f"{scheme}://{self.host}:{self.port}"
+    async def _ensure_connected(self, username: str, password: str) -> Host:
+        """Ensure we have a connected reolink_aio Host."""
+        if self._api is None:
+            self._api = Host(self.host, username, password, port=self.port)
 
-    async def _ensure_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            # Disable SSL verification for cameras with self-signed certs
-            conn = aiohttp.TCPConnector(ssl=False)
-            self._session = aiohttp.ClientSession(connector=conn)
-        return self._session
+        if not self._logged_in:
+            try:
+                await self._api.get_host_data()
+                self._logged_in = True
+                logger.info("Connected to camera %s via reolink_aio", self.host)
+            except Exception as e:
+                logger.error("Failed to connect to %s: %s", self.host, e)
+                raise
+
+        return self._api
 
     async def close(self):
-        if self._session and not self._session.closed:
-            await self._session.close()
-
-    async def _send_command(
-        self, cmd: str, params: dict, username: str, password: str, action: int = 0
-    ) -> list[dict]:
-        """Send a command to the Reolink HTTP API."""
-        session = await self._ensure_session()
-        url = f"{self.base_url}/api.cgi?cmd={cmd}&user={username}&password={password}"
-        body = [{"cmd": cmd, "action": action, "param": params}]
-
-        try:
-            async with session.post(url, json=body, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                data = await resp.json(content_type=None)
-                return data
-        except aiohttp.ClientError as e:
-            logger.error("Failed to send %s to %s: %s", cmd, self.host, e)
-            raise
+        if self._api and self._logged_in:
+            try:
+                await self._api.logout()
+            except Exception:
+                pass
+            self._logged_in = False
 
     async def probe_capabilities(self, username: str, password: str, channel: int = 0) -> None:
         """Probe camera to determine which PTZ features it supports."""
-        # Check Set3DPos support via Get3DPos
-        data = await self._send_command("Get3DPos", {"channel": channel}, username, password, action=1)
-        self._supports_3d_pos = bool(data and data[0].get("code") == 0)
+        api = await self._ensure_connected(username, password)
 
-        # Check if camera reports tilt position
-        pos = await self.get_position(username, password, channel)
-        self._has_tilt = pos.tilt != 0 or True  # We can't tell from one reading
+        # Check Set3DPos support
+        self._supports_3d_pos = api.supported(channel, "ptz_3d_zoom")
 
-        # Actually check by looking at the position fields returned
-        data = await self._send_command(
-            "GetPtzCurPos", {"PtzCurPos": {"channel": channel}}, username, password
-        )
-        if data and data[0].get("code") == 0:
-            pos_data = data[0]["value"].get("PtzCurPos", {})
-            self._has_tilt = "Tpos" in pos_data
+        # If reolink_aio doesn't know about ptz_3d_zoom yet, probe directly
+        if not self._supports_3d_pos:
+            try:
+                result = await api.send(
+                    [{"cmd": "Get3DPos", "action": 1, "param": {"channel": channel}}],
+                    expected_response_type="json",
+                )
+                if result and result[0].get("code") == 0:
+                    self._supports_3d_pos = True
+            except Exception:
+                self._supports_3d_pos = False
+
+        # Baichuan always reports both Ppos and Tpos
+        self._has_tilt = True
 
         logger.info(
             "Camera %s capabilities: Set3DPos=%s, has_tilt=%s",
@@ -103,194 +100,80 @@ class ReolinkAPI:
 
     @property
     def has_tilt(self) -> bool:
-        return self._has_tilt is True
+        return self._has_tilt
 
-    async def relative_move_feedback(
-        self,
-        username: str,
-        password: str,
-        pan: float,
-        tilt: float,
-        speed: float = 1.0,
-        fov_pan_units: int = 170,
-        fov_tilt_units: int = 95,
-        move_speed: int = 15,
-        channel: int = 0,
-    ) -> bool:
-        """Implement RelativeMove using position-feedback ContinuousMove.
+    async def get_position(self, username: str, password: str, channel: int = 0) -> PtzPosition:
+        """Get current PTZ pan/tilt position via Baichuan."""
+        api = await self._ensure_connected(username, password)
+        try:
+            pan = api.ptz_pan_position(channel)
+            tilt = api.ptz_tilt_position(channel)
+            # Refresh position data
+            await api.get_states(cmd_list={"GetPtzCurPos": {channel: 1}})
+            pan = api.ptz_pan_position(channel) or 0
+            tilt = api.ptz_tilt_position(channel) or 0
+            return PtzPosition(pan=pan, tilt=tilt)
+        except Exception as e:
+            logger.warning("Failed to get position for %s: %s", self.host, e)
+            return PtzPosition()
 
-        Starts moving in the target direction, polls position, and stops
-        when the camera has moved approximately the right amount.
+    async def get_zoom_focus(self, username: str, password: str, channel: int = 0) -> ZoomFocus:
+        """Get current zoom and focus values."""
+        api = await self._ensure_connected(username, password)
+        try:
+            await api.get_states(cmd_list={"GetZoomFocus": {channel: 1}})
+            zf = api.zoom_range(channel)
+            zoom = zf.get("zoom", {})
+            focus = zf.get("focus", {})
+            return ZoomFocus(
+                zoom_pos=zoom.get("pos", 0),
+                zoom_min=zoom.get("min", 0),
+                zoom_max=zoom.get("max", 33),
+                focus_pos=focus.get("pos", 0),
+                focus_min=focus.get("min", 0),
+                focus_max=focus.get("max", 255),
+            )
+        except Exception as e:
+            logger.warning("Failed to get zoom/focus for %s: %s", self.host, e)
+            return ZoomFocus()
 
-        Args:
-            pan: -1.0 to 1.0 (left to right within FOV)
-            tilt: -1.0 to 1.0 (down to up within FOV)
-            speed: 0.0 to 1.0 (ONVIF speed parameter)
-            fov_pan_units: FOV width in camera position units at full zoom-out
-            fov_tilt_units: FOV height in camera position units at full zoom-out
-            move_speed: base movement speed (1-64)
-        """
-        # Get starting position and current zoom to scale FOV
-        start_pos = await self.get_position(username, password, channel)
-        zoom_focus = await self.get_zoom_focus(username, password, channel)
-
-        # Scale FOV by zoom level: more zoom = smaller FOV = smaller movements
-        # zoom_pos=0 (no zoom) → scale=1.0, zoom_pos=zoom_max (full zoom) → scale≈0.05
-        zoom_ratio = zoom_focus.zoom_pos / max(zoom_focus.zoom_max, 1)
-        # Exponential scaling: each doubling of zoom halves the FOV
-        zoom_scale = 1.0 / (1.0 + zoom_ratio * 19)  # range: 1.0 down to 0.05
-        effective_pan_fov = fov_pan_units * zoom_scale
-        effective_tilt_fov = fov_tilt_units * zoom_scale
-
-        logger.debug(
-            "Camera %s: zoom_pos=%d/%d, zoom_scale=%.2f, effective_fov=%.0f/%.0f",
-            self.host, zoom_focus.zoom_pos, zoom_focus.zoom_max,
-            zoom_scale, effective_pan_fov, effective_tilt_fov,
-        )
-
-        # Reolink Ppos decreases when panning right, so invert pan
-        target_pan_delta = -pan * effective_pan_fov / 2
-        target_tilt_delta = tilt * effective_tilt_fov / 2
-
-        if abs(target_pan_delta) < 3 and abs(target_tilt_delta) < 3:
-            return True  # Movement too small, skip
-
-        # Determine direction
-        from .ptz_translator import continuous_move_to_op
-        op, _ = continuous_move_to_op(pan, tilt, 0)
-        if op == "Stop":
-            return True
-
-        # Scale speed: ONVIF speed * config move_speed
-        cmd_speed = max(1, min(64, int(speed * move_speed)))
-
-        # Estimate units/sec for timed tilt moves (scales with speed)
-        units_per_sec_at_speed_10 = 135.0
-
-        if self._has_tilt:
-            # Full feedback loop for both axes
-            await self.ptz_control(username, password, op, cmd_speed, channel)
-
-            max_polls = 30
-            poll_interval = 0.1
-            target_pan = start_pos.pan + target_pan_delta
-            target_tilt = start_pos.tilt + target_tilt_delta
-
-            for _ in range(max_polls):
-                await asyncio.sleep(poll_interval)
-                current = await self.get_position(username, password, channel)
-
-                pan_reached = abs(target_pan_delta) < 3 or abs(current.pan - target_pan) < abs(target_pan_delta) * 0.3
-                tilt_reached = abs(target_tilt_delta) < 3 or abs(current.tilt - target_tilt) < abs(target_tilt_delta) * 0.3
-                pan_overshot = abs(current.pan - start_pos.pan) > abs(target_pan_delta) * 1.2
-                tilt_overshot = abs(current.tilt - start_pos.tilt) > abs(target_tilt_delta) * 1.2
-
-                if (pan_reached and tilt_reached) or pan_overshot or tilt_overshot:
-                    break
-
-            await self.ptz_control(username, password, "Stop", channel=channel)
-        else:
-            # No tilt feedback: handle pan and tilt separately
-
-            # Pan with position feedback
-            if abs(target_pan_delta) >= 3:
-                pan_op = "Right" if pan > 0 else "Left"
-                await self.ptz_control(username, password, pan_op, cmd_speed, channel)
-
-                target_pan = start_pos.pan + target_pan_delta
-                max_polls = 30
-                for _ in range(max_polls):
-                    await asyncio.sleep(0.1)
-                    current = await self.get_position(username, password, channel)
-                    if abs(current.pan - target_pan) < abs(target_pan_delta) * 0.3:
-                        break
-                    if abs(current.pan - start_pos.pan) > abs(target_pan_delta) * 1.2:
-                        break
-
-                await self.ptz_control(username, password, "Stop", channel=channel)
-                await asyncio.sleep(0.3)
-
-            # Tilt with timed move (no position feedback available)
-            if abs(target_tilt_delta) >= 3:
-                tilt_op = "Up" if tilt > 0 else "Down"
-                move_speed = max(1, min(10, cmd_speed))
-                duration = abs(target_tilt_delta) / (units_per_sec_at_speed_10 * move_speed / 10)
-                duration = min(duration, 2.0)  # cap at 2 seconds
-
-                logger.debug("Camera %s: timed tilt %s for %.2fs at speed %d", self.host, tilt_op, duration, move_speed)
-                await self.ptz_control(username, password, tilt_op, move_speed, channel)
-                await asyncio.sleep(duration)
-                await self.ptz_control(username, password, "Stop", channel=channel)
-
-        return True
+    async def get_presets(self, username: str, password: str, channel: int = 0) -> list[dict]:
+        """Get list of PTZ presets."""
+        api = await self._ensure_connected(username, password)
+        try:
+            presets_dict = api.ptz_presets(channel)
+            return [
+                {"token": str(preset_id), "name": name}
+                for name, preset_id in presets_dict.items()
+            ]
+        except Exception:
+            return []
 
     async def get_stream_resolution(self, username: str, password: str, channel: int = 0) -> StreamResolution:
         """Get stream resolutions via Get3DPos. Caches the result."""
         if self._stream_resolution is not None:
             return self._stream_resolution
 
-        data = await self._send_command("Get3DPos", {"channel": channel}, username, password, action=1)
-
-        if data and data[0].get("code") == 0:
-            pos = data[0]["value"]["3d_pos"]
-            main = pos.get("mainStream", {})
-            self._stream_resolution = StreamResolution(
-                width=main.get("width", 3840),
-                height=main.get("height", 2160),
+        api = await self._ensure_connected(username, password)
+        try:
+            result = await api.send(
+                [{"cmd": "Get3DPos", "action": 1, "param": {"channel": channel}}],
+                expected_response_type="json",
             )
-        else:
-            logger.warning("Get3DPos failed for %s, using defaults", self.host)
+            if result and result[0].get("code") == 0:
+                pos = result[0]["value"]["3d_pos"]
+                main = pos.get("mainStream", {})
+                self._stream_resolution = StreamResolution(
+                    width=main.get("width", 3840),
+                    height=main.get("height", 2160),
+                )
+        except Exception as e:
+            logger.warning("Get3DPos failed for %s: %s", self.host, e)
+
+        if self._stream_resolution is None:
             self._stream_resolution = StreamResolution()
 
         return self._stream_resolution
-
-    async def get_position(self, username: str, password: str, channel: int = 0) -> PtzPosition:
-        """Get current PTZ pan/tilt position."""
-        data = await self._send_command(
-            "GetPtzCurPos", {"PtzCurPos": {"channel": channel}}, username, password
-        )
-
-        if data and data[0].get("code") == 0:
-            pos = data[0]["value"].get("PtzCurPos", {})
-            return PtzPosition(pan=pos.get("Ppos", 0), tilt=pos.get("Tpos", 0))
-
-        return PtzPosition()
-
-    async def get_zoom_focus(self, username: str, password: str, channel: int = 0) -> ZoomFocus:
-        """Get current zoom and focus values."""
-        data = await self._send_command("GetZoomFocus", {"channel": channel}, username, password, action=1)
-
-        if data and data[0].get("code") == 0:
-            val = data[0]["value"].get("ZoomFocus", {})
-            zoom = val.get("zoom", {})
-            focus = val.get("focus", {})
-            rng = data[0].get("range", {}).get("ZoomFocus", {})
-            zoom_range = rng.get("zoom", {}).get("pos", {})
-            focus_range = rng.get("focus", {}).get("pos", {})
-            return ZoomFocus(
-                zoom_pos=zoom.get("pos", 0),
-                zoom_min=zoom_range.get("min", 0),
-                zoom_max=zoom_range.get("max", 33),
-                focus_pos=focus.get("pos", 0),
-                focus_min=focus_range.get("min", 0),
-                focus_max=focus_range.get("max", 255),
-            )
-
-        return ZoomFocus()
-
-    async def get_presets(self, username: str, password: str, channel: int = 0) -> list[dict]:
-        """Get list of PTZ presets."""
-        data = await self._send_command("GetPtzPreset", {"channel": channel}, username, password)
-
-        presets = []
-        if data and data[0].get("code") == 0:
-            for preset in data[0]["value"].get("PtzPreset", []):
-                if int(preset.get("enable", 0)) == 1:
-                    presets.append({
-                        "token": str(preset["id"]),
-                        "name": preset.get("name", f"Preset {preset['id']}"),
-                    })
-        return presets
 
     async def set_3d_pos(
         self,
@@ -306,53 +189,131 @@ class ReolinkAPI:
         channel: int = 0,
     ) -> bool:
         """Send a 3D zoom command (Set3DPos)."""
-        data = await self._send_command(
-            "Set3DPos",
-            {
-                "3DPos": {
-                    "channel": channel,
-                    "posX": pos_x,
-                    "posY": pos_y,
-                    "posWidth": pos_width,
-                    "posHeight": pos_height,
-                    "speed": speed,
-                    "width": stream_width,
-                    "height": stream_height,
-                }
-            },
-            username,
-            password,
-        )
-
-        return bool(data and data[0].get("code") == 0)
+        api = await self._ensure_connected(username, password)
+        try:
+            await api.send_setting(
+                [
+                    {
+                        "cmd": "Set3DPos",
+                        "action": 0,
+                        "param": {
+                            "3DPos": {
+                                "channel": channel,
+                                "posX": pos_x,
+                                "posY": pos_y,
+                                "posWidth": pos_width,
+                                "posHeight": pos_height,
+                                "speed": speed,
+                                "width": stream_width,
+                                "height": stream_height,
+                            }
+                        },
+                    }
+                ]
+            )
+            return True
+        except Exception as e:
+            logger.error("Set3DPos failed for %s: %s", self.host, e)
+            return False
 
     async def ptz_control(
         self, username: str, password: str, op: str, speed: int = 25, channel: int = 0
     ) -> bool:
-        """Send a PTZ control command (ContinuousMove, Stop, etc.)."""
-        params: dict = {"channel": channel, "op": op}
-        if op != "Stop":
-            params["speed"] = speed
-
-        data = await self._send_command("PtzCtrl", params, username, password)
-        return bool(data and data[0].get("code") == 0)
+        """Send a PTZ control command."""
+        api = await self._ensure_connected(username, password)
+        try:
+            await api.set_ptz_command(channel, command=op, speed=speed)
+            return True
+        except Exception as e:
+            logger.error("PtzCtrl %s failed for %s: %s", op, self.host, e)
+            return False
 
     async def goto_preset(
         self, username: str, password: str, preset_id: int, speed: int = 25, channel: int = 0
     ) -> bool:
         """Move to a PTZ preset."""
-        params: dict = {"channel": channel, "op": "ToPos", "id": preset_id, "speed": speed}
-        data = await self._send_command("PtzCtrl", params, username, password)
-        return bool(data and data[0].get("code") == 0)
+        api = await self._ensure_connected(username, password)
+        try:
+            await api.set_ptz_command(channel, preset=preset_id, speed=speed)
+            return True
+        except Exception as e:
+            logger.error("GotoPreset failed for %s: %s", self.host, e)
+            return False
 
     async def set_zoom(
         self, username: str, password: str, zoom_pos: int, channel: int = 0
     ) -> bool:
         """Set absolute zoom position."""
-        data = await self._send_command(
-            "StartZoomFocus",
-            {"ZoomFocus": {"channel": channel, "op": "ZoomPos", "pos": zoom_pos}},
-            username,
-            password,
+        api = await self._ensure_connected(username, password)
+        try:
+            await api.set_zoom(channel, zoom_pos)
+            return True
+        except Exception as e:
+            logger.error("SetZoom failed for %s: %s", self.host, e)
+            return False
+
+    async def relative_move_feedback(
+        self,
+        username: str,
+        password: str,
+        pan: float,
+        tilt: float,
+        speed: float = 1.0,
+        fov_pan_units: int = 170,
+        fov_tilt_units: int = 95,
+        move_speed: int = 15,
+        channel: int = 0,
+    ) -> bool:
+        """Implement RelativeMove using position-feedback ContinuousMove.
+
+        Uses Baichuan for position feedback (both pan and tilt).
+        """
+        start_pos = await self.get_position(username, password, channel)
+        zoom_focus = await self.get_zoom_focus(username, password, channel)
+
+        # Scale FOV by zoom level
+        zoom_ratio = zoom_focus.zoom_pos / max(zoom_focus.zoom_max, 1)
+        zoom_scale = 1.0 / (1.0 + zoom_ratio * 19)
+        effective_pan_fov = fov_pan_units * zoom_scale
+        effective_tilt_fov = fov_tilt_units * zoom_scale
+
+        logger.debug(
+            "Camera %s: zoom_pos=%d/%d, zoom_scale=%.2f, effective_fov=%.0f/%.0f",
+            self.host, zoom_focus.zoom_pos, zoom_focus.zoom_max,
+            zoom_scale, effective_pan_fov, effective_tilt_fov,
         )
-        return bool(data and data[0].get("code") == 0)
+
+        # Reolink Ppos decreases when panning right, so invert pan
+        target_pan_delta = -pan * effective_pan_fov / 2
+        target_tilt_delta = tilt * effective_tilt_fov / 2
+
+        if abs(target_pan_delta) < 3 and abs(target_tilt_delta) < 3:
+            return True
+
+        from .ptz_translator import continuous_move_to_op
+        op, _ = continuous_move_to_op(pan, tilt, 0)
+        if op == "Stop":
+            return True
+
+        cmd_speed = max(1, min(64, int(speed * move_speed)))
+
+        # Full feedback loop — Baichuan gives us both pan and tilt
+        await self.ptz_control(username, password, op, cmd_speed, channel)
+
+        target_pan = start_pos.pan + target_pan_delta
+        target_tilt = start_pos.tilt + target_tilt_delta
+
+        for _ in range(30):
+            await asyncio.sleep(0.1)
+            current = await self.get_position(username, password, channel)
+
+            pan_reached = abs(target_pan_delta) < 3 or abs(current.pan - target_pan) < abs(target_pan_delta) * 0.3
+            tilt_reached = abs(target_tilt_delta) < 3 or abs(current.tilt - target_tilt) < abs(target_tilt_delta) * 0.3
+            pan_overshot = abs(current.pan - start_pos.pan) > abs(target_pan_delta) * 1.2
+            tilt_overshot = abs(current.tilt - start_pos.tilt) > abs(target_tilt_delta) * 1.2
+
+            if (pan_reached and tilt_reached) or pan_overshot or tilt_overshot:
+                break
+
+        await self.ptz_control(username, password, "Stop", channel=channel)
+        return True
