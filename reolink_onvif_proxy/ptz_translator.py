@@ -40,23 +40,19 @@ def relative_move_to_3d_pos(
     tilt = max(-1.0, min(1.0, tilt))
     zoom = max(-1.0, min(1.0, zoom))
 
-    # Convert relative offset to pixel position
-    # pan=0,tilt=0 means center of frame (no movement)
-    # pan=1.0 means right edge, pan=-1.0 means left edge
-    target_x = (stream_width / 2) + (pan * stream_width / 2)
-    target_y = (stream_height / 2) - (tilt * stream_height / 2)
-
-    # Clamp to stream bounds
-    target_x = max(0, min(stream_width, int(target_x)))
-    target_y = max(0, min(stream_height, int(target_y)))
+    # Set3DPos uses posX/posY as the TOP-LEFT corner of the target box,
+    # not the center. The camera reframes to show the specified rectangle.
+    # Full frame (0, 0, W, H) = no movement.
 
     # Box size determines zoom level
-    # No zoom component: full frame (reposition only)
-    # Positive zoom: smaller box (zoom in)
-    # Negative zoom: larger box (zoom out) — capped at stream size
+    # For pan/tilt-only moves (no zoom), use a box slightly smaller than full frame.
+    # A full-frame box (0,0,W,H) means "no change" — the box must be smaller
+    # and offset to tell the camera where to reframe.
+    # We use 90% of frame size for pan/tilt-only moves so the camera
+    # repositions without significant zoom change.
     if abs(zoom) < 0.01:
-        box_width = stream_width
-        box_height = stream_height
+        box_width = int(stream_width * 0.9)
+        box_height = int(stream_height * 0.9)
     else:
         # Scale factor: zoom=1.0 → box is 10% of frame (10x zoom)
         # zoom=-1.0 → box is full frame (1x zoom / zoom out)
@@ -70,12 +66,26 @@ def relative_move_to_3d_pos(
     box_width = max(100, box_width)
     box_height = max(100, box_height)
 
+    # Convert relative offset to the top-left corner of the target box.
+    # pan=0,tilt=0 → box centered on frame → top-left at (W/2 - boxW/2, H/2 - boxH/2)
+    # pan=1.0 → box shifted fully right → top-left at (W - boxW, H/2 - boxH/2)
+    # pan=-1.0 → box shifted fully left → top-left at (0, H/2 - boxH/2)
+    center_x = (stream_width / 2) + (pan * stream_width / 2)
+    center_y = (stream_height / 2) - (tilt * stream_height / 2)
+
+    pos_x = int(center_x - box_width / 2)
+    pos_y = int(center_y - box_height / 2)
+
+    # Clamp so the box stays within frame bounds
+    pos_x = max(0, min(stream_width - box_width, pos_x))
+    pos_y = max(0, min(stream_height - box_height, pos_y))
+
     # Map ONVIF speed (0-1) to Reolink speed (1-64)
     reolink_speed = max(1, min(64, int(speed * 60) + 1))
 
     return Set3DPosParams(
-        pos_x=target_x,
-        pos_y=target_y,
+        pos_x=pos_x,
+        pos_y=pos_y,
         pos_width=box_width,
         pos_height=box_height,
         width=stream_width,

@@ -127,17 +127,18 @@ class ReolinkAPI:
         # Get starting position
         start_pos = await self.get_position(username, password, channel)
 
-        # Estimate target movement in camera position units
-        # Reolink pan range is typically 0-3600 (360 degrees * 10)
-        # A full FOV is roughly 60-100 degrees depending on zoom
-        # Estimate FOV as ~800 position units (rough approximation)
-        fov_pan_units = 800
-        fov_tilt_units = 450
+        # Estimate target movement in camera position units.
+        # Reolink pan range is 0-3600 (360 degrees * 10).
+        # At full zoom-out, horizontal FOV is ~60 degrees = ~170 position units.
+        # Measured: speed 25 moves ~337 units/sec, so FOV is crossed in ~0.5s.
+        fov_pan_units = 170
+        fov_tilt_units = 95
 
-        target_pan_delta = pan * fov_pan_units / 2
+        # Reolink Ppos decreases when panning right, so invert pan
+        target_pan_delta = -pan * fov_pan_units / 2
         target_tilt_delta = tilt * fov_tilt_units / 2
 
-        if abs(target_pan_delta) < 5 and abs(target_tilt_delta) < 5:
+        if abs(target_pan_delta) < 3 and abs(target_tilt_delta) < 3:
             return True  # Movement too small, skip
 
         # Determine direction
@@ -146,37 +147,68 @@ class ReolinkAPI:
         if op == "Stop":
             return True
 
-        # Scale speed
-        cmd_speed = max(1, min(64, int(speed * 40) + 1))
+        # Use low speed for precision
+        cmd_speed = max(1, min(20, int(speed * 15) + 1))
 
-        # Start moving
-        await self.ptz_control(username, password, op, cmd_speed, channel)
+        # Measured: at speed 10, camera moves ~135 pan units/sec.
+        # We use this to estimate timed moves for axes without position feedback.
+        units_per_sec_at_speed_10 = 135.0
 
-        # Poll position until we've moved enough or timeout
-        max_polls = 30  # 3 seconds max
-        poll_interval = 0.1
-        target_pan = start_pos.pan + target_pan_delta
-        target_tilt = start_pos.tilt + target_tilt_delta
+        if self._has_tilt:
+            # Full feedback loop for both axes
+            await self.ptz_control(username, password, op, cmd_speed, channel)
 
-        for _ in range(max_polls):
-            await asyncio.sleep(poll_interval)
-            current = await self.get_position(username, password, channel)
+            max_polls = 30
+            poll_interval = 0.1
+            target_pan = start_pos.pan + target_pan_delta
+            target_tilt = start_pos.tilt + target_tilt_delta
 
-            pan_done = abs(current.pan - target_pan) < abs(target_pan_delta) * 0.3
-            tilt_done = (
-                not self._has_tilt
-                or abs(current.tilt - target_tilt) < abs(target_tilt_delta) * 0.3
-            )
+            for _ in range(max_polls):
+                await asyncio.sleep(poll_interval)
+                current = await self.get_position(username, password, channel)
 
-            # Check if we've overshot
-            pan_overshot = abs(current.pan - start_pos.pan) > abs(target_pan_delta) * 1.2
-            tilt_overshot = self._has_tilt and abs(current.tilt - start_pos.tilt) > abs(target_tilt_delta) * 1.2
+                pan_reached = abs(target_pan_delta) < 3 or abs(current.pan - target_pan) < abs(target_pan_delta) * 0.3
+                tilt_reached = abs(target_tilt_delta) < 3 or abs(current.tilt - target_tilt) < abs(target_tilt_delta) * 0.3
+                pan_overshot = abs(current.pan - start_pos.pan) > abs(target_pan_delta) * 1.2
+                tilt_overshot = abs(current.tilt - start_pos.tilt) > abs(target_tilt_delta) * 1.2
 
-            if pan_done or tilt_done or pan_overshot or tilt_overshot:
-                break
+                if (pan_reached and tilt_reached) or pan_overshot or tilt_overshot:
+                    break
 
-        # Stop
-        await self.ptz_control(username, password, "Stop", channel=channel)
+            await self.ptz_control(username, password, "Stop", channel=channel)
+        else:
+            # No tilt feedback: handle pan and tilt separately
+
+            # Pan with position feedback
+            if abs(target_pan_delta) >= 3:
+                pan_op = "Right" if pan > 0 else "Left"
+                await self.ptz_control(username, password, pan_op, cmd_speed, channel)
+
+                target_pan = start_pos.pan + target_pan_delta
+                max_polls = 30
+                for _ in range(max_polls):
+                    await asyncio.sleep(0.1)
+                    current = await self.get_position(username, password, channel)
+                    if abs(current.pan - target_pan) < abs(target_pan_delta) * 0.3:
+                        break
+                    if abs(current.pan - start_pos.pan) > abs(target_pan_delta) * 1.2:
+                        break
+
+                await self.ptz_control(username, password, "Stop", channel=channel)
+                await asyncio.sleep(0.3)
+
+            # Tilt with timed move (no position feedback available)
+            if abs(target_tilt_delta) >= 3:
+                tilt_op = "Up" if tilt > 0 else "Down"
+                move_speed = max(1, min(10, cmd_speed))
+                duration = abs(target_tilt_delta) / (units_per_sec_at_speed_10 * move_speed / 10)
+                duration = min(duration, 2.0)  # cap at 2 seconds
+
+                logger.debug("Camera %s: timed tilt %s for %.2fs at speed %d", self.host, tilt_op, duration, move_speed)
+                await self.ptz_control(username, password, tilt_op, move_speed, channel)
+                await asyncio.sleep(duration)
+                await self.ptz_control(username, password, "Stop", channel=channel)
+
         return True
 
     async def get_stream_resolution(self, username: str, password: str, channel: int = 0) -> StreamResolution:

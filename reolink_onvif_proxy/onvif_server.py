@@ -363,14 +363,25 @@ class ONVIFServer:
             if speed_pt is not None:
                 speed = float(speed_pt.get("x", "1.0"))
 
-        if self.api.supports_3d_pos:
-            # Use Set3DPos (atomic pan+tilt+zoom)
+        logger.info(
+            "Camera %s: RelativeMove pan=%.3f tilt=%.3f zoom=%.3f speed=%.3f",
+            self.config.name, pan, tilt, zoom, speed,
+        )
+
+        has_zoom = abs(zoom) >= 0.01
+        if self.api.supports_3d_pos and has_zoom:
+            # Use Set3DPos when zoom is involved (atomic pan+tilt+zoom)
             resolution = await self.api.get_stream_resolution(username, password)
             params = relative_move_to_3d_pos(
                 pan=pan, tilt=tilt, zoom=zoom,
                 stream_width=resolution.width,
                 stream_height=resolution.height,
                 speed=speed,
+            )
+            logger.info(
+                "Camera %s: Set3DPos posX=%d posY=%d posW=%d posH=%d (stream %dx%d)",
+                self.config.name, params.pos_x, params.pos_y,
+                params.pos_width, params.pos_height, params.width, params.height,
             )
             await self.api.set_3d_pos(
                 username=username, password=password,
@@ -380,8 +391,10 @@ class ONVIFServer:
                 speed=params.speed,
             )
         else:
-            # Fallback: position-feedback ContinuousMove
-            logger.debug("Camera %s: using position-feedback RelativeMove (no Set3DPos)", self.config.name)
+            # Pan/tilt only (no zoom): use position-feedback ContinuousMove
+            # This avoids unwanted zoom side effects from Set3DPos and handles
+            # movements beyond the visible frame
+            logger.debug("Camera %s: using position-feedback RelativeMove (pan/tilt only)", self.config.name)
             await self.api.relative_move_feedback(
                 username=username, password=password,
                 pan=pan, tilt=tilt, speed=speed,
