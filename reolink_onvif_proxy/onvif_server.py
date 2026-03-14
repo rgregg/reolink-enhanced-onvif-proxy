@@ -30,10 +30,12 @@ MEDIA_NS = "http://www.onvif.org/ver10/media/wsdl"
 SCHEMA_NS = "http://www.onvif.org/ver10/schema"
 
 
-def _extract_credentials(root: etree._Element) -> tuple[str, str] | None:
+def _extract_credentials(root: etree._Element) -> tuple[str, str, bool] | None:
     """Extract username and password from WS-Security UsernameToken header.
 
-    Supports both plaintext password and password digest authentication.
+    Returns (username, password_or_digest, is_plaintext) or None if no auth header.
+    For plaintext: password_or_digest is the actual password.
+    For digest: password_or_digest is the digest value (needs validation against known password).
     """
     security = root.find(f".//{{{WSSE_NS}}}Security")
     if security is None:
@@ -50,21 +52,45 @@ def _extract_credentials(root: etree._Element) -> tuple[str, str] | None:
         return None
 
     username = username_el.text or ""
+    password_value = password_el.text or ""
 
-    # Check password type
     password_type = password_el.get("Type", "")
     if "PasswordDigest" in password_type:
-        # For digest auth, we can't extract the plain password.
-        # We'll need to pass through the raw password and let the Reolink API handle it.
-        # Actually, Reolink uses basic auth (user/pass in URL), so we need the plain password.
-        # ONVIF digest auth: Digest = Base64(SHA1(Nonce + Created + Password))
-        # We can't reverse this, so we need clients to use plaintext password mode.
-        # Frigate uses the password directly, so this should work.
-        logger.warning("Password digest auth not supported — use plaintext password in ONVIF config")
-        return None
+        return username, password_value, False
+    else:
+        return username, password_value, True
 
-    password = password_el.text or ""
-    return username, password
+
+def _validate_digest(
+    digest: str, root: etree._Element, expected_password: str
+) -> bool:
+    """Validate a WS-Security PasswordDigest against the expected password.
+
+    Digest = Base64(SHA1(Nonce + Created + Password))
+    """
+    security = root.find(f".//{{{WSSE_NS}}}Security")
+    if security is None:
+        return False
+
+    token = security.find(f"{{{WSSE_NS}}}UsernameToken")
+    if token is None:
+        return False
+
+    nonce_el = token.find(f"{{{WSSE_NS}}}Nonce")
+    created_el = token.find(f"{{{WSU_NS}}}Created")
+
+    if nonce_el is None or created_el is None:
+        return False
+
+    nonce = base64.b64decode(nonce_el.text or "")
+    created = (created_el.text or "").encode("utf-8")
+
+    # Compute expected digest: Base64(SHA1(Nonce + Created + Password))
+    expected_digest = base64.b64encode(
+        hashlib.sha1(nonce + created + expected_password.encode("utf-8")).digest()
+    ).decode("utf-8")
+
+    return digest == expected_digest
 
 
 def _get_soap_action(root: etree._Element) -> str | None:
@@ -136,14 +162,35 @@ class ONVIFServer:
 
         logger.debug("Camera %s: ONVIF action: %s", self.config.name, action)
 
-        # GetSystemDateAndTime doesn't require auth
+        # Build base URL for service discovery responses
+        base_url = f"http://{request.host}"
+
+        # These operations don't require auth
         if action == "GetSystemDateAndTime":
             return web.Response(
                 body=responses.get_system_date_and_time(),
                 content_type="application/soap+xml",
             )
 
-        # All other operations require authentication
+        if action == "GetCapabilities":
+            return web.Response(
+                body=responses.get_capabilities(base_url),
+                content_type="application/soap+xml",
+            )
+
+        if action == "GetServices":
+            return web.Response(
+                body=responses.get_services(base_url),
+                content_type="application/soap+xml",
+            )
+
+        if action == "GetDeviceInformation":
+            return web.Response(
+                body=responses.get_device_information(),
+                content_type="application/soap+xml",
+            )
+
+        # Authenticate the request
         creds = _extract_credentials(root)
         if creds is None:
             return web.Response(
@@ -152,7 +199,44 @@ class ONVIFServer:
                 status=401,
             )
 
-        username, password = creds
+        soap_username, password_value, is_plaintext = creds
+
+        if self.config.username and self.config.password:
+            # Validate credentials against config
+            if soap_username != self.config.username:
+                return web.Response(
+                    body=responses.fault_not_authorized(),
+                    content_type="application/soap+xml",
+                    status=401,
+                )
+            if is_plaintext:
+                if password_value != self.config.password:
+                    return web.Response(
+                        body=responses.fault_not_authorized(),
+                        content_type="application/soap+xml",
+                        status=401,
+                    )
+            else:
+                # Validate digest
+                if not _validate_digest(password_value, root, self.config.password):
+                    return web.Response(
+                        body=responses.fault_not_authorized(),
+                        content_type="application/soap+xml",
+                        status=401,
+                    )
+            # Use config credentials for Reolink API
+            username, password = self.config.username, self.config.password
+        elif is_plaintext:
+            # No config credentials — pass through plaintext
+            username, password = soap_username, password_value
+        else:
+            # Digest auth with no config credentials — can't extract password
+            logger.error("Camera %s: digest auth received but no credentials in config", self.config.name)
+            return web.Response(
+                body=responses.fault_not_authorized(),
+                content_type="application/soap+xml",
+                status=401,
+            )
 
         try:
             response_body = await self._dispatch(action, root, username, password)

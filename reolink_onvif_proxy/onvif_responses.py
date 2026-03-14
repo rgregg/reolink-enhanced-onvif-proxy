@@ -56,7 +56,7 @@ def _soap_fault(code: str, reason: str, detail: str = "") -> bytes:
 
     reason_el = etree.SubElement(fault, f"{{{NS['s']}}}Reason")
     text_el = etree.SubElement(reason_el, f"{{{NS['s']}}}Text")
-    text_el.set(f"{{{etree.QName('http://www.w3.org/XML/1998/namespace', 'lang')}}}", "en")
+    text_el.set("{http://www.w3.org/XML/1998/namespace}lang", "en")
     text_el.text = reason
 
     if detail:
@@ -72,6 +72,58 @@ def fault_not_authorized() -> bytes:
 
 def fault_action_not_supported(action: str) -> bytes:
     return _soap_fault("Sender", "Action not supported", f"The requested action '{action}' is not supported")
+
+
+def get_capabilities(base_url: str) -> bytes:
+    """Response for GetCapabilities — tells the client where to find services."""
+    resp = etree.Element(f"{{{NS['tds']}}}GetCapabilitiesResponse")
+    caps = etree.SubElement(resp, f"{{{NS['tds']}}}Capabilities")
+
+    # Device capability
+    device = etree.SubElement(caps, f"{{{NS['tt']}}}Device")
+    etree.SubElement(device, f"{{{NS['tt']}}}XAddr").text = f"{base_url}/onvif/device_service"
+
+    # Media capability
+    media = etree.SubElement(caps, f"{{{NS['tt']}}}Media")
+    etree.SubElement(media, f"{{{NS['tt']}}}XAddr").text = f"{base_url}/onvif/media_service"
+
+    # PTZ capability
+    ptz = etree.SubElement(caps, f"{{{NS['tt']}}}PTZ")
+    etree.SubElement(ptz, f"{{{NS['tt']}}}XAddr").text = f"{base_url}/onvif/ptz_service"
+
+    return _soap_envelope(resp)
+
+
+def get_services(base_url: str) -> bytes:
+    """Response for GetServices — lists available ONVIF services with their URLs."""
+    resp = etree.Element(f"{{{NS['tds']}}}GetServicesResponse")
+
+    services = [
+        ("http://www.onvif.org/ver10/device/wsdl", f"{base_url}/onvif/device_service"),
+        ("http://www.onvif.org/ver10/media/wsdl", f"{base_url}/onvif/media_service"),
+        ("http://www.onvif.org/ver20/ptz/wsdl", f"{base_url}/onvif/ptz_service"),
+    ]
+
+    for namespace, xaddr in services:
+        svc = etree.SubElement(resp, f"{{{NS['tds']}}}Service")
+        etree.SubElement(svc, f"{{{NS['tds']}}}Namespace").text = namespace
+        etree.SubElement(svc, f"{{{NS['tds']}}}XAddr").text = xaddr
+        ver = etree.SubElement(svc, f"{{{NS['tds']}}}Version")
+        etree.SubElement(ver, f"{{{NS['tt']}}}Major").text = "2"
+        etree.SubElement(ver, f"{{{NS['tt']}}}Minor").text = "0"
+
+    return _soap_envelope(resp)
+
+
+def get_device_information() -> bytes:
+    """Response for GetDeviceInformation."""
+    resp = etree.Element(f"{{{NS['tds']}}}GetDeviceInformationResponse")
+    etree.SubElement(resp, f"{{{NS['tds']}}}Manufacturer").text = "Reolink"
+    etree.SubElement(resp, f"{{{NS['tds']}}}Model").text = "Enhanced ONVIF Proxy"
+    etree.SubElement(resp, f"{{{NS['tds']}}}FirmwareVersion").text = "0.1.0"
+    etree.SubElement(resp, f"{{{NS['tds']}}}SerialNumber").text = "PROXY-001"
+    etree.SubElement(resp, f"{{{NS['tds']}}}HardwareId").text = "PROXY"
+    return _soap_envelope(resp)
 
 
 def fault_device_error(message: str) -> bytes:

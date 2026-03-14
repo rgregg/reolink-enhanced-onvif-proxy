@@ -12,6 +12,8 @@ class CameraConfig:
     host: str
     port: int = 80
     listen_port: int = 8000
+    username: str = ""
+    password: str = ""
 
 
 @dataclass
@@ -32,6 +34,8 @@ def load_config(path: str | Path) -> ProxyConfig:
                 host=cam["host"],
                 port=cam.get("port", 80),
                 listen_port=cam["listen_port"],
+                username=cam.get("username", ""),
+                password=cam.get("password", ""),
             )
         )
 
