@@ -260,6 +260,9 @@ class ONVIFServer:
         if action == "GetProfiles":
             return responses.get_profiles()
 
+        elif action == "GetVideoSources":
+            return responses.get_video_sources()
+
         elif action == "GetConfigurationOptions":
             return responses.get_configuration_options()
 

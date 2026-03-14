@@ -130,6 +130,17 @@ def fault_device_error(message: str) -> bytes:
     return _soap_fault("Receiver", "Device error", message)
 
 
+def get_video_sources() -> bytes:
+    """Response for GetVideoSources."""
+    resp = etree.Element(f"{{{NS['trt']}}}GetVideoSourcesResponse")
+    source = etree.SubElement(resp, f"{{{NS['trt']}}}VideoSources", token=VIDEO_SOURCE_TOKEN)
+    etree.SubElement(source, f"{{{NS['tt']}}}Framerate").text = "25"
+    res = etree.SubElement(source, f"{{{NS['tt']}}}Resolution")
+    etree.SubElement(res, f"{{{NS['tt']}}}Width").text = "3840"
+    etree.SubElement(res, f"{{{NS['tt']}}}Height").text = "2160"
+    return _soap_envelope(resp)
+
+
 def _range_element(parent: etree._Element, tag: str, uri: str, x_min: float, x_max: float, y_min: float | None = None, y_max: float | None = None):
     """Build a PTZ space range element."""
     space = etree.SubElement(parent, f"{{{NS['tt']}}}{tag}")
