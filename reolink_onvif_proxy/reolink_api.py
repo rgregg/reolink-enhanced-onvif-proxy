@@ -41,11 +41,14 @@ class ReolinkAPI:
 
     @property
     def base_url(self) -> str:
-        return f"http://{self.host}:{self.port}"
+        scheme = "https" if self.port == 443 else "http"
+        return f"{scheme}://{self.host}:{self.port}"
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            # Disable SSL verification for cameras with self-signed certs
+            conn = aiohttp.TCPConnector(ssl=False)
+            self._session = aiohttp.ClientSession(connector=conn)
         return self._session
 
     async def close(self):
