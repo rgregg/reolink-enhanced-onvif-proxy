@@ -398,6 +398,9 @@ class ONVIFServer:
             await self.api.relative_move_feedback(
                 username=username, password=password,
                 pan=pan, tilt=tilt, speed=speed,
+                fov_pan_units=self.config.fov_pan_units,
+                fov_tilt_units=self.config.fov_tilt_units,
+                move_speed=self.config.move_speed,
             )
 
         self.state.mark_moving()

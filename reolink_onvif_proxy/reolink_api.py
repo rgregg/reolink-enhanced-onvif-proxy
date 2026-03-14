@@ -112,6 +112,9 @@ class ReolinkAPI:
         pan: float,
         tilt: float,
         speed: float = 1.0,
+        fov_pan_units: int = 170,
+        fov_tilt_units: int = 95,
+        move_speed: int = 15,
         channel: int = 0,
     ) -> bool:
         """Implement RelativeMove using position-feedback ContinuousMove.
@@ -122,36 +125,46 @@ class ReolinkAPI:
         Args:
             pan: -1.0 to 1.0 (left to right within FOV)
             tilt: -1.0 to 1.0 (down to up within FOV)
-            speed: 0.0 to 1.0
+            speed: 0.0 to 1.0 (ONVIF speed parameter)
+            fov_pan_units: FOV width in camera position units at full zoom-out
+            fov_tilt_units: FOV height in camera position units at full zoom-out
+            move_speed: base movement speed (1-64)
         """
-        # Get starting position
+        # Get starting position and current zoom to scale FOV
         start_pos = await self.get_position(username, password, channel)
+        zoom_focus = await self.get_zoom_focus(username, password, channel)
 
-        # Estimate target movement in camera position units.
-        # Reolink pan range is 0-3600 (360 degrees * 10).
-        # At full zoom-out, horizontal FOV is ~60 degrees = ~170 position units.
-        # Measured: speed 25 moves ~337 units/sec, so FOV is crossed in ~0.5s.
-        fov_pan_units = 170
-        fov_tilt_units = 95
+        # Scale FOV by zoom level: more zoom = smaller FOV = smaller movements
+        # zoom_pos=0 (no zoom) → scale=1.0, zoom_pos=zoom_max (full zoom) → scale≈0.05
+        zoom_ratio = zoom_focus.zoom_pos / max(zoom_focus.zoom_max, 1)
+        # Exponential scaling: each doubling of zoom halves the FOV
+        zoom_scale = 1.0 / (1.0 + zoom_ratio * 19)  # range: 1.0 down to 0.05
+        effective_pan_fov = fov_pan_units * zoom_scale
+        effective_tilt_fov = fov_tilt_units * zoom_scale
+
+        logger.debug(
+            "Camera %s: zoom_pos=%d/%d, zoom_scale=%.2f, effective_fov=%.0f/%.0f",
+            self.host, zoom_focus.zoom_pos, zoom_focus.zoom_max,
+            zoom_scale, effective_pan_fov, effective_tilt_fov,
+        )
 
         # Reolink Ppos decreases when panning right, so invert pan
-        target_pan_delta = -pan * fov_pan_units / 2
-        target_tilt_delta = tilt * fov_tilt_units / 2
+        target_pan_delta = -pan * effective_pan_fov / 2
+        target_tilt_delta = tilt * effective_tilt_fov / 2
 
         if abs(target_pan_delta) < 3 and abs(target_tilt_delta) < 3:
             return True  # Movement too small, skip
 
         # Determine direction
         from .ptz_translator import continuous_move_to_op
-        op, cmd_speed = continuous_move_to_op(pan, tilt, 0)
+        op, _ = continuous_move_to_op(pan, tilt, 0)
         if op == "Stop":
             return True
 
-        # Use low speed for precision
-        cmd_speed = max(1, min(20, int(speed * 15) + 1))
+        # Scale speed: ONVIF speed * config move_speed
+        cmd_speed = max(1, min(64, int(speed * move_speed)))
 
-        # Measured: at speed 10, camera moves ~135 pan units/sec.
-        # We use this to estimate timed moves for axes without position feedback.
+        # Estimate units/sec for timed tilt moves (scales with speed)
         units_per_sec_at_speed_10 = 135.0
 
         if self._has_tilt:

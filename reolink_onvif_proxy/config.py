@@ -14,6 +14,14 @@ class CameraConfig:
     listen_port: int = 8000
     username: str = ""
     password: str = ""
+    # FOV size in camera position units at full zoom-out.
+    # These are used for position-feedback RelativeMove.
+    # Adjust per camera if click-to-move overshoots or undershoots.
+    fov_pan_units: int = 170
+    fov_tilt_units: int = 95
+    # Movement speed for position-feedback moves (1-64).
+    # Lower = more precise but slower.
+    move_speed: int = 15
 
 
 @dataclass
@@ -36,6 +44,9 @@ def load_config(path: str | Path) -> ProxyConfig:
                 listen_port=cam["listen_port"],
                 username=cam.get("username", ""),
                 password=cam.get("password", ""),
+                fov_pan_units=cam.get("fov_pan_units", 170),
+                fov_tilt_units=cam.get("fov_tilt_units", 95),
+                move_speed=cam.get("move_speed", 15),
             )
         )
 

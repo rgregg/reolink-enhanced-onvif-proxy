@@ -2,8 +2,16 @@ cameras:
   - name: front_yard
     host: 192.168.1.10
     port: 80
+    username: admin
+    password: your_password
     listen_port: 8001
+    # Optional: tune click-to-move behavior per camera.
+    # fov_pan_units: horizontal FOV in camera position units at full zoom-out (default: 170)
+    # fov_tilt_units: vertical FOV in camera position units at full zoom-out (default: 95)
+    # move_speed: movement speed for position-feedback moves, 1-64 (default: 15)
   - name: back_yard
     host: 192.168.1.11
     port: 80
+    username: admin
+    password: your_password
     listen_port: 8002

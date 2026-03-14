@@ -147,9 +147,17 @@ If you see `supportPtz3DLocation` with a non-zero version, your camera is compat
 cameras:
   - name: string          # Camera name (for logging)
     host: string          # Camera IP address
-    port: int             # Camera HTTP API port (default: 80)
+    port: int             # Camera HTTP API port (default: 80, use 443 for HTTPS)
+    username: string      # Camera credentials
+    password: string
     listen_port: int      # Port the proxy listens on for ONVIF connections
+    # Optional: tune click-to-move precision per camera
+    fov_pan_units: int    # Horizontal FOV in position units at full zoom-out (default: 170)
+    fov_tilt_units: int   # Vertical FOV in position units at full zoom-out (default: 95)
+    move_speed: int       # Movement speed for feedback moves, 1-64 (default: 15)
 ```
+
+The `fov_pan_units` and `fov_tilt_units` values control how far the camera moves for click-to-move. Increase them if the camera doesn't move far enough, decrease if it overshoots. These values are automatically scaled by zoom level — when zoomed in, movements are proportionally smaller.
 
 ## License
 
