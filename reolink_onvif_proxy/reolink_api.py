@@ -43,6 +43,7 @@ class ReolinkAPI:
         self._stream_resolution: StreamResolution | None = None
         self._supports_3d_pos: bool | None = None
         self._has_tilt: bool = True  # Baichuan always returns tilt
+        self._supports_ptz_speed: bool = True  # assume yes, learn on first failure
 
     async def _ensure_connected(self, username: str, password: str) -> Host:
         """Ensure we have a connected reolink_aio Host."""
@@ -223,11 +224,14 @@ class ReolinkAPI:
         """Send a PTZ control command."""
         api = await self._ensure_connected(username, password)
         try:
-            await api.set_ptz_command(channel, command=op, speed=speed)
+            if self._supports_ptz_speed:
+                await api.set_ptz_command(channel, command=op, speed=speed)
+            else:
+                await api.set_ptz_command(channel, command=op)
             return True
         except NotSupportedError:
-            # Camera doesn't support speed parameter — retry without it
-            logger.debug("Camera %s: retrying %s without speed", self.host, op)
+            self._supports_ptz_speed = False
+            logger.info("Camera %s: PTZ speed not supported, disabling for future commands", self.host)
             try:
                 await api.set_ptz_command(channel, command=op)
                 return True
@@ -244,9 +248,14 @@ class ReolinkAPI:
         """Move to a PTZ preset."""
         api = await self._ensure_connected(username, password)
         try:
-            await api.set_ptz_command(channel, preset=preset_id, speed=speed)
+            if self._supports_ptz_speed:
+                await api.set_ptz_command(channel, preset=preset_id, speed=speed)
+            else:
+                await api.set_ptz_command(channel, preset=preset_id)
             return True
         except NotSupportedError:
+            self._supports_ptz_speed = False
+            logger.info("Camera %s: PTZ speed not supported, disabling for future commands", self.host)
             try:
                 await api.set_ptz_command(channel, preset=preset_id)
                 return True
