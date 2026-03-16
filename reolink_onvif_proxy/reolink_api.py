@@ -104,8 +104,8 @@ class ReolinkAPI:
 
     async def get_position(self, username: str, password: str, channel: int = 0) -> PtzPosition:
         """Get current PTZ pan/tilt position via Baichuan."""
-        api = await self._ensure_connected(username, password)
         try:
+            api = await self._ensure_connected(username, password)
             pan = api.ptz_pan_position(channel)
             tilt = api.ptz_tilt_position(channel)
             # Refresh position data
@@ -119,8 +119,8 @@ class ReolinkAPI:
 
     async def get_zoom_focus(self, username: str, password: str, channel: int = 0) -> ZoomFocus:
         """Get current zoom and focus values."""
-        api = await self._ensure_connected(username, password)
         try:
+            api = await self._ensure_connected(username, password)
             await api.get_states(cmd_list={"GetZoomFocus": {channel: 1}})
             zf = api.zoom_range(channel)
             zoom = zf.get("zoom", {})

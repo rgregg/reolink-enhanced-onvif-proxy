@@ -160,7 +160,7 @@ class ONVIFServer:
                 status=400,
             )
 
-        logger.debug("Camera %s: ONVIF action: %s", self.config.name, action)
+        logger.info("Camera %s: ONVIF action: %s", self.config.name, action)
 
         # Build base URL for service discovery responses
         base_url = f"http://{request.host}"
@@ -193,6 +193,7 @@ class ONVIFServer:
         # Authenticate the request
         creds = _extract_credentials(root)
         if creds is None:
+            logger.warning("Camera %s: %s rejected — no auth credentials in request", self.config.name, action)
             return web.Response(
                 body=responses.fault_not_authorized(),
                 content_type="application/soap+xml",
@@ -204,6 +205,7 @@ class ONVIFServer:
         if self.config.username and self.config.password:
             # Validate credentials against config
             if soap_username != self.config.username:
+                logger.warning("Camera %s: %s rejected — username mismatch", self.config.name, action)
                 return web.Response(
                     body=responses.fault_not_authorized(),
                     content_type="application/soap+xml",
@@ -211,6 +213,7 @@ class ONVIFServer:
                 )
             if is_plaintext:
                 if password_value != self.config.password:
+                    logger.warning("Camera %s: %s rejected — password mismatch", self.config.name, action)
                     return web.Response(
                         body=responses.fault_not_authorized(),
                         content_type="application/soap+xml",
@@ -219,6 +222,7 @@ class ONVIFServer:
             else:
                 # Validate digest
                 if not _validate_digest(password_value, root, self.config.password):
+                    logger.warning("Camera %s: %s rejected — digest auth failed", self.config.name, action)
                     return web.Response(
                         body=responses.fault_not_authorized(),
                         content_type="application/soap+xml",
@@ -280,6 +284,11 @@ class ONVIFServer:
             pos = await self.api.get_position(username, password)
             zf = await self.api.get_zoom_focus(username, password)
             self.state.update_position(pos, zf)
+            logger.info(
+                "Camera %s: GetStatus pan=%d tilt=%d zoom=%d/%d status=%s",
+                self.config.name, pos.pan, pos.tilt, zf.zoom_pos, zf.zoom_max,
+                self.state.move_status.value,
+            )
             return responses.get_status(
                 pan=pos.pan,
                 tilt=pos.tilt,
@@ -391,10 +400,9 @@ class ONVIFServer:
                 speed=params.speed,
             )
         else:
-            # Pan/tilt only (no zoom): use position-feedback ContinuousMove
-            # This avoids unwanted zoom side effects from Set3DPos and handles
-            # movements beyond the visible frame
-            logger.debug("Camera %s: using position-feedback RelativeMove (pan/tilt only)", self.config.name)
+            # Use position-feedback ContinuousMove for pan/tilt
+            # and digital zoom via SetZoomFocus when zoom is requested
+            logger.debug("Camera %s: using position-feedback RelativeMove", self.config.name)
             await self.api.relative_move_feedback(
                 username=username, password=password,
                 pan=pan, tilt=tilt, speed=speed,
@@ -402,6 +410,20 @@ class ONVIFServer:
                 fov_tilt_units=self.config.fov_tilt_units,
                 move_speed=self.config.move_speed,
             )
+
+            # Apply digital zoom if requested
+            if has_zoom:
+                zoom_focus = await self.api.get_zoom_focus(username, password)
+                zoom_range = zoom_focus.zoom_max - zoom_focus.zoom_min
+                # zoom parameter is 0-1 where higher = more zoom in
+                target_zoom = zoom_focus.zoom_pos + int(zoom * zoom_range)
+                target_zoom = max(zoom_focus.zoom_min, min(zoom_focus.zoom_max, target_zoom))
+                logger.info(
+                    "Camera %s: digital zoom %d -> %d (range %d-%d)",
+                    self.config.name, zoom_focus.zoom_pos, target_zoom,
+                    zoom_focus.zoom_min, zoom_focus.zoom_max,
+                )
+                await self.api.set_zoom(username, password, target_zoom)
 
         self.state.mark_moving()
 
