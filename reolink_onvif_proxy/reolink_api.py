@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 
 from reolink_aio.api import Host
+from reolink_aio.exceptions import NotSupportedError
 
 logger = logging.getLogger(__name__)
 
@@ -224,6 +225,15 @@ class ReolinkAPI:
         try:
             await api.set_ptz_command(channel, command=op, speed=speed)
             return True
+        except NotSupportedError:
+            # Camera doesn't support speed parameter — retry without it
+            logger.debug("Camera %s: retrying %s without speed", self.host, op)
+            try:
+                await api.set_ptz_command(channel, command=op)
+                return True
+            except Exception as e:
+                logger.error("PtzCtrl %s failed for %s: %s", op, self.host, e)
+                return False
         except Exception as e:
             logger.error("PtzCtrl %s failed for %s: %s", op, self.host, e)
             return False
@@ -236,6 +246,13 @@ class ReolinkAPI:
         try:
             await api.set_ptz_command(channel, preset=preset_id, speed=speed)
             return True
+        except NotSupportedError:
+            try:
+                await api.set_ptz_command(channel, preset=preset_id)
+                return True
+            except Exception as e:
+                logger.error("GotoPreset failed for %s: %s", self.host, e)
+                return False
         except Exception as e:
             logger.error("GotoPreset failed for %s: %s", self.host, e)
             return False
