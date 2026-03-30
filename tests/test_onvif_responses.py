@@ -10,6 +10,7 @@ from reolink_onvif_proxy.onvif_responses import (
     get_service_capabilities,
     get_status,
     get_system_date_and_time,
+    set_preset_response,
     simple_response,
 )
 
@@ -149,6 +150,28 @@ class TestGetStatus:
         assert zoom is not None
         zoom_val = float(zoom.get("x"))
         assert 0.4 < zoom_val < 0.6  # ~16/33
+
+
+class TestSetPresetResponse:
+    def test_returns_valid_soap(self):
+        root = _parse(set_preset_response("5"))
+        body = root.find(f"{{{NS['s']}}}Body")
+        assert body is not None
+        assert "SetPresetResponse" in body[0].tag
+
+    def test_has_preset_token(self):
+        root = _parse(set_preset_response("5"))
+        token = root.find(f".//{{{NS['tptz']}}}PresetToken")
+        assert token is not None
+        assert token.text == "5"
+
+
+class TestRemovePresetResponse:
+    def test_generates_valid_soap(self):
+        root = _parse(simple_response("tptz", "RemovePreset"))
+        body = root.find(f"{{{NS['s']}}}Body")
+        assert body is not None
+        assert "RemovePresetResponse" in body[0].tag
 
 
 class TestSimpleResponse:

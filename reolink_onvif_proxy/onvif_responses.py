@@ -345,6 +345,13 @@ def get_status(
     return _soap_envelope(resp)
 
 
+def set_preset_response(preset_token: str) -> bytes:
+    """Response for SetPreset — returns the token of the created/updated preset."""
+    resp = etree.Element(f"{{{NS['tptz']}}}SetPresetResponse")
+    etree.SubElement(resp, f"{{{NS['tptz']}}}PresetToken").text = preset_token
+    return _soap_envelope(resp)
+
+
 def simple_response(namespace: str, operation: str) -> bytes:
     """Build a simple empty response for void operations (Stop, ContinuousMove, etc.)."""
     resp = etree.Element(f"{{{NS[namespace]}}}{operation}Response")

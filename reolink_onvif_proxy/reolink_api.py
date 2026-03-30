@@ -266,6 +266,55 @@ class ReolinkAPI:
             logger.error("GotoPreset failed for %s: %s", self.host, e)
             return False
 
+    async def set_preset(
+        self, username: str, password: str, preset_id: int, name: str, channel: int = 0
+    ) -> bool:
+        """Save current position as a PTZ preset."""
+        api = await self._ensure_connected(username, password)
+        try:
+            await api.send_setting(
+                [
+                    {
+                        "cmd": "PtzCtrl",
+                        "action": 0,
+                        "param": {
+                            "channel": channel,
+                            "op": "SetPreset",
+                            "id": preset_id,
+                            "name": name,
+                        },
+                    }
+                ]
+            )
+            return True
+        except Exception as e:
+            logger.error("SetPreset failed for %s: %s", self.host, e)
+            return False
+
+    async def remove_preset(
+        self, username: str, password: str, preset_id: int, channel: int = 0
+    ) -> bool:
+        """Delete a PTZ preset."""
+        api = await self._ensure_connected(username, password)
+        try:
+            await api.send_setting(
+                [
+                    {
+                        "cmd": "PtzCtrl",
+                        "action": 0,
+                        "param": {
+                            "channel": channel,
+                            "op": "DelPreset",
+                            "id": preset_id,
+                        },
+                    }
+                ]
+            )
+            return True
+        except Exception as e:
+            logger.error("RemovePreset failed for %s: %s", self.host, e)
+            return False
+
     async def set_zoom(
         self, username: str, password: str, zoom_pos: int, channel: int = 0
     ) -> bool:

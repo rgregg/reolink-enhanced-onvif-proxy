@@ -318,6 +318,19 @@ class ONVIFServer:
             await self._handle_goto_preset(body, username, password)
             return responses.simple_response("tptz", "GotoPreset")
 
+        elif action == "SetPreset":
+            preset_token = await self._handle_set_preset(body, username, password)
+            return responses.set_preset_response(preset_token)
+
+        elif action == "RemovePreset":
+            action_el = body[0]
+            token_el = action_el.find(f"{{{PTZ_NS}}}PresetToken")
+            if token_el is not None and token_el.text:
+                preset_id = int(token_el.text)
+                await self.api.remove_preset(username, password, preset_id)
+                logger.info("Camera %s: RemovePreset id=%d", self.config.name, preset_id)
+            return responses.simple_response("tptz", "RemovePreset")
+
         elif action == "GetConfigurations":
             # Return same PTZ config as in profile
             return responses.get_profiles()  # Close enough for Frigate
@@ -450,3 +463,27 @@ class ONVIFServer:
             preset_id = int(token_el.text)
             await self.api.goto_preset(username, password, preset_id)
             self.state.mark_moving()
+
+    async def _handle_set_preset(self, body: etree._Element, username: str, password: str) -> str:
+        """Handle SetPreset — save current position as a preset."""
+        action_el = body[0]
+        token_el = action_el.find(f"{{{PTZ_NS}}}PresetToken")
+        name_el = action_el.find(f"{{{PTZ_NS}}}PresetName")
+
+        name = name_el.text if name_el is not None and name_el.text else None
+
+        if token_el is not None and token_el.text:
+            # Update existing preset
+            preset_id = int(token_el.text)
+        else:
+            # Create new preset — find lowest unused ID
+            existing = await self.api.get_presets(username, password)
+            used_ids = {int(p["token"]) for p in existing}
+            preset_id = next(i for i in range(1, 65) if i not in used_ids)
+
+        if name is None:
+            name = f"Preset {preset_id}"
+
+        await self.api.set_preset(username, password, preset_id, name)
+        logger.info("Camera %s: SetPreset id=%d name='%s'", self.config.name, preset_id, name)
+        return str(preset_id)
