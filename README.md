@@ -128,7 +128,22 @@ Magnification per zoom step is model-specific and non-linear. Measure it once (e
 
 Values between points are interpolated in log space. Without a curve the proxy assumes magnification grows geometrically from 1x to `max_zoom_magnification` (default 4.0) across the zoom range.
 
-Cameras without `Set3DPos` fall back to a position-feedback `ContinuousMove` (tuned with `fov_pan_units`/`fov_tilt_units`/`move_speed`), which is less accurate because the camera coasts after `Stop`.
+#### Cameras without `Set3DPos` (e.g. TrackMix)
+
+These fall back to closed-loop `ContinuousMove`: each axis moves in turn while the proxy polls the position, then up to two correction passes. Set `fov_pan_units`/`fov_tilt_units` to the position units spanning the full view **at 1x zoom** (the proxy divides by the current magnification from `zoom_magnification`). Measure by nudging the camera and comparing frames: a TrackMix is about 805 pan / 900 tilt units.
+
+Learned at runtime, per camera:
+- **Counter direction** — lake_view's pan position counts down going right; a TrackMix counts up.
+- **Overshoot** — polling lag plus coast after `Stop`, used as lead on later moves.
+- **Minimum movement** — a TrackMix moves ~20 units per command whatever the speed, so corrections smaller than that are skipped. That sets the accuracy floor (about +/-1.5% of the frame at 1x).
+
+The first move or two after a restart are less accurate while these are learned.
+
+#### Frigate's stale zoom
+
+Frigate seeds its `RelativeMove` request from the camera position at startup and, for cameras with autotracking zoom enabled, never clears the zoom field, so plain clicks carry a stale zoom value. The proxy only honors a zoom translation when the request also carries a zoom speed, which Frigate always sets for a real drag-to-zoom.
+
+Some models (TrackMix) also aren't detected as zoom-capable by `reolink_aio`; the proxy then reads and sets zoom with raw `GetZoomFocus`/`StartZoomFocus`.
 
 ### Position Reporting
 

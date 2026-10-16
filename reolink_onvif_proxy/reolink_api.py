@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 
 from reolink_aio.api import Host
@@ -44,6 +45,10 @@ class ReolinkAPI:
         self._supports_3d_pos: bool | None = None
         self._has_tilt: bool = True  # Baichuan always returns tilt
         self._supports_ptz_speed: bool = True  # assume yes, learn on first failure
+        # Learned per-model movement behaviour for position-feedback moves
+        self._axis_direction: dict[str, int] = {}  # +1 if Right/Up increases position
+        self._lead: dict[str, float] = {}  # axis -> overshoot past the stop point
+        self._min_pulse: dict[str, float] = {}  # axis -> smallest movement one command makes
 
     async def _ensure_connected(self, username: str, password: str) -> Host:
         """Ensure we have a connected reolink_aio Host."""
@@ -123,10 +128,25 @@ class ReolinkAPI:
         """Get current zoom and focus values."""
         try:
             api = await self._ensure_connected(username, password)
-            await api.get_states(cmd_list={"GetZoomFocus": {channel: 1}})
             zf = api.zoom_range(channel)
-            zoom = zf.get("zoom", {})
-            focus = zf.get("focus", {})
+            zoom = dict(zf.get("zoom", {}))
+            focus = dict(zf.get("focus", {}))
+            if api.supported(channel, "zoom"):
+                await api.get_states(cmd_list={"GetZoomFocus": {channel: 1}})
+                zf = api.zoom_range(channel)
+                zoom = zf.get("zoom", {})
+                focus = zf.get("focus", {})
+            else:
+                # reolink_aio skips GetZoomFocus when it doesn't detect zoom
+                # (e.g. TrackMix), leaving the startup value; ask directly.
+                result = await api.send(
+                    [{"cmd": "GetZoomFocus", "action": 0, "param": {"channel": channel}}],
+                    expected_response_type="json",
+                )
+                if result and result[0].get("code") == 0:
+                    value = result[0]["value"]["ZoomFocus"]
+                    zoom["pos"] = value.get("zoom", {}).get("pos", zoom.get("pos", 0))
+                    focus["pos"] = value.get("focus", {}).get("pos", focus.get("pos", 0))
             return ZoomFocus(
                 zoom_pos=zoom.get("pos", 0),
                 zoom_min=zoom.get("min", 0),
@@ -323,9 +343,28 @@ class ReolinkAPI:
         try:
             await api.set_zoom(channel, zoom_pos)
             return True
+        except NotSupportedError:
+            # reolink_aio does not detect zoom on some models (e.g. TrackMix),
+            # but the camera still accepts StartZoomFocus directly.
+            pass
         except Exception as e:
             logger.error("SetZoom failed for %s: %s", self.host, e)
             return False
+        try:
+            result = await api.send(
+                [{
+                    "cmd": "StartZoomFocus",
+                    "action": 0,
+                    "param": {"ZoomFocus": {"channel": channel, "op": "ZoomPos", "pos": zoom_pos}},
+                }],
+                expected_response_type="json",
+            )
+            if result and result[0].get("code") == 0:
+                return True
+            logger.error("SetZoom failed for %s: %s", self.host, result)
+        except Exception as e:
+            logger.error("SetZoom failed for %s: %s", self.host, e)
+        return False
 
     async def relative_move_feedback(
         self,
@@ -333,62 +372,112 @@ class ReolinkAPI:
         password: str,
         pan: float,
         tilt: float,
-        speed: float = 1.0,
-        fov_pan_units: int = 170,
-        fov_tilt_units: int = 95,
+        pan_units: float,
+        tilt_units: float,
         move_speed: int = 15,
         channel: int = 0,
     ) -> bool:
-        """Implement RelativeMove using position-feedback ContinuousMove.
+        """Implement RelativeMove with ContinuousMove and position feedback.
 
-        Uses Baichuan for position feedback (both pan and tilt).
+        pan/tilt are ONVIF FOV offsets (-1..1); pan_units/tilt_units are the
+        camera position units spanning the current view (already scaled for
+        zoom). Each axis moves in turn, closed-loop, with correction passes.
         """
-        start_pos = await self.get_position(username, password, channel)
-        zoom_focus = await self.get_zoom_focus(username, password, channel)
+        for axis, amount, units in (("pan", pan, pan_units), ("tilt", tilt, tilt_units)):
+            distance = abs(amount) * units / 2
+            tolerance = max(2.0, units * 0.015)
+            if distance < tolerance:
+                continue
+            if axis == "pan":
+                ops = ("Right", "Left") if amount > 0 else ("Left", "Right")
+            else:
+                ops = ("Up", "Down") if amount > 0 else ("Down", "Up")
+            await self._move_axis(
+                username, password, axis, ops, distance, tolerance, move_speed, channel
+            )
+        return True
 
-        # Scale FOV by zoom level
-        zoom_ratio = zoom_focus.zoom_pos / max(zoom_focus.zoom_max, 1)
-        zoom_scale = 1.0 / (1.0 + zoom_ratio * 19)
-        effective_pan_fov = fov_pan_units * zoom_scale
-        effective_tilt_fov = fov_tilt_units * zoom_scale
+    async def _axis_position(self, username: str, password: str, axis: str, channel: int) -> int:
+        pos = await self.get_position(username, password, channel)
+        return pos.pan if axis == "pan" else pos.tilt
 
-        logger.debug(
-            "Camera %s: zoom_pos=%d/%d, zoom_scale=%.2f, effective_fov=%.0f/%.0f",
-            self.host, zoom_focus.zoom_pos, zoom_focus.zoom_max,
-            zoom_scale, effective_pan_fov, effective_tilt_fov,
-        )
+    async def _move_axis(
+        self,
+        username: str,
+        password: str,
+        axis: str,
+        ops: tuple[str, str],
+        distance: float,
+        tolerance: float,
+        move_speed: int,
+        channel: int,
+    ) -> None:
+        """Move one axis `distance` units toward ops[0], correcting overshoot.
 
-        # Reolink Ppos decreases when panning right, so invert pan
-        target_pan_delta = -pan * effective_pan_fov / 2
-        target_tilt_delta = tilt * effective_tilt_fov / 2
+        Which way the position counter runs differs by model (lake_view's pan
+        counts down going right, TrackMix counts up), so it is learned from
+        the first movement. The overshoot (polling lag plus coast after Stop)
+        is learned and used as lead. Each command also moves some minimum
+        distance (~20 units on a TrackMix, whatever the speed), so a correction
+        that would land further off than the current error is skipped.
+        """
+        start = await self._axis_position(username, password, axis, channel)
+        current = start
+        forward_positive = ops[0] in ("Right", "Up")
 
-        if abs(target_pan_delta) < 3 and abs(target_tilt_delta) < 3:
-            return True
-
-        from .ptz_translator import continuous_move_to_op
-        op, _ = continuous_move_to_op(pan, tilt, 0)
-        if op == "Stop":
-            return True
-
-        cmd_speed = max(1, min(64, int(speed * move_speed)))
-
-        # Full feedback loop — Baichuan gives us both pan and tilt
-        await self.ptz_control(username, password, op, cmd_speed, channel)
-
-        target_pan = start_pos.pan + target_pan_delta
-        target_tilt = start_pos.tilt + target_tilt_delta
-
-        for _ in range(30):
-            await asyncio.sleep(0.1)
-            current = await self.get_position(username, password, channel)
-
-            pan_reached = abs(target_pan_delta) < 3 or abs(current.pan - target_pan) < abs(target_pan_delta) * 0.3
-            tilt_reached = abs(target_tilt_delta) < 3 or abs(current.tilt - target_tilt) < abs(target_tilt_delta) * 0.3
-            pan_overshot = abs(current.pan - start_pos.pan) > abs(target_pan_delta) * 1.2
-            tilt_overshot = abs(current.tilt - start_pos.tilt) > abs(target_tilt_delta) * 1.2
-
-            if (pan_reached and tilt_reached) or pan_overshot or tilt_overshot:
+        for attempt in range(3):
+            direction = self._axis_direction.get(axis)
+            if direction is None:
+                progress = abs(current - start)
+            else:
+                progress = (current - start) * (direction if forward_positive else -direction)
+            remaining = distance - progress
+            if abs(remaining) < tolerance:
                 break
 
-        await self.ptz_control(username, password, "Stop", channel=channel)
-        return True
+            op = ops[0] if remaining > 0 else ops[1]
+            speed = move_speed if attempt == 0 else max(1, move_speed // 3)
+            lead = self._lead.get(axis, 0.0)
+            target = max(abs(remaining) - lead, 1.0)
+            if attempt > 0 and self._min_pulse.get(axis, 0.0) >= 2 * abs(remaining):
+                break  # smallest possible nudge would land further off
+            segment_start = current
+
+            await self.ptz_control(username, password, op, speed, channel)
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
+                current = await self._axis_position(username, password, axis, channel)
+                if abs(current - segment_start) >= target:
+                    break
+            await self.ptz_control(username, password, "Stop", channel=channel)
+            stopped_at = current
+
+            # Let it coast to rest
+            last = None
+            for _ in range(20):
+                await asyncio.sleep(0.1)
+                current = await self._axis_position(username, password, axis, channel)
+                if current == last:
+                    break
+                last = current
+
+            moved = current - segment_start
+            if moved != 0 and axis not in self._axis_direction:
+                increases = moved > 0
+                self._axis_direction[axis] = 1 if increases == (op in ("Right", "Up")) else -1
+                logger.info(
+                    "Camera %s: %s position %s when moving %s",
+                    self.host, axis, "increases" if increases else "decreases", op,
+                )
+            if target <= 1.0:
+                prev = self._min_pulse.get(axis)
+                self._min_pulse[axis] = abs(moved) if prev is None else 0.5 * prev + 0.5 * abs(moved)
+            else:
+                overshoot = max(0.0, abs(moved) - target)
+                prev = self._lead.get(axis)
+                self._lead[axis] = overshoot if prev is None else 0.5 * prev + 0.5 * overshoot
+            logger.info(
+                "Camera %s: %s %s speed=%d wanted=%.0f moved=%d coast=%d",
+                self.host, axis, op, speed, abs(remaining), abs(moved), abs(current - stopped_at),
+            )

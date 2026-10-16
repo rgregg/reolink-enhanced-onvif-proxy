@@ -394,6 +394,16 @@ class ONVIFServer:
             if speed_pt is not None:
                 speed = float(speed_pt.get("x", "1.0"))
 
+            # Frigate seeds its RelativeMove request from the camera's position
+            # at startup and, for cameras with autotracking zoom, never clears
+            # Translation/Zoom -- so plain clicks carry a stale zoom position.
+            # Its genuine drag-to-zoom always sets Speed/Zoom; trust only that.
+            if zoom != 0.0 and speed_parent.find(f"{{{SCHEMA_NS}}}Zoom") is None:
+                logger.debug(
+                    "Camera %s: ignoring zoom=%.3f without a zoom speed", self.config.name, zoom
+                )
+                zoom = 0.0
+
         logger.info(
             "Camera %s: RelativeMove pan=%.3f tilt=%.3f zoom=%.3f speed=%.3f",
             self.config.name, pan, tilt, zoom, speed,
@@ -405,22 +415,30 @@ class ONVIFServer:
             self._start_action(self._relative_move_3d(pan, tilt, zoom, speed, username, password))
             return
 
-        # No Set3DPos: position-feedback ContinuousMove for pan/tilt
-        logger.debug("Camera %s: using position-feedback RelativeMove", self.config.name)
+        self._start_action(self._relative_move_feedback(pan, tilt, zoom, username, password))
+
+    async def _relative_move_feedback(
+        self, pan: float, tilt: float, zoom: float, username: str, password: str
+    ):
+        """No Set3DPos: closed-loop ContinuousMove for pan/tilt, then the zoom step."""
+        zf = await self.api.get_zoom_focus(username, password)
+        start_step = zf.zoom_pos
+        mag = self._zoom_curve(zf).magnification(start_step) if zf.zoom_max > zf.zoom_min else 1.0
         await self.api.relative_move_feedback(
             username=username, password=password,
-            pan=pan, tilt=tilt, speed=speed,
-            fov_pan_units=self.config.fov_pan_units,
-            fov_tilt_units=self.config.fov_tilt_units,
+            pan=pan, tilt=tilt,
+            pan_units=self.config.fov_pan_units / mag,
+            tilt_units=self.config.fov_tilt_units / mag,
             move_speed=self.config.move_speed,
         )
-        if abs(zoom) >= 0.01:
-            zf = await self.api.get_zoom_focus(username, password)
-            target = self._zoom_target(zf, zf.zoom_pos, zoom)
-            if target != zf.zoom_pos:
-                await self.api.set_zoom(username, password, target)
-
-        self.state.mark_moving()
+        target_step = self._zoom_target(zf, start_step, zoom)
+        if target_step != start_step:
+            logger.info(
+                "Camera %s: zoom %d -> %d (requested %.3f)",
+                self.config.name, start_step, target_step, zoom,
+            )
+            await self.api.set_zoom(username, password, target_step)
+            await self._wait_until_settled(username, password)
 
     async def _relative_move_3d(
         self, pan: float, tilt: float, zoom: float, speed: float, username: str, password: str
@@ -465,12 +483,15 @@ class ONVIFServer:
         """Zoom step for a RelativeMove zoom value, starting from start_step."""
         if abs(zoom) < 0.01 or zf.zoom_max <= zf.zoom_min:
             return start_step
-        curve = ZoomCurve(
+        curve = self._zoom_curve(zf)
+        return curve.step_for(target_magnification(curve.magnification(start_step), zoom))
+
+    def _zoom_curve(self, zf: ZoomFocus) -> ZoomCurve:
+        return ZoomCurve(
             zf.zoom_min, zf.zoom_max,
             points=self.config.zoom_magnification,
             max_magnification=self.config.max_zoom_magnification,
         )
-        return curve.step_for(target_magnification(curve.magnification(start_step), zoom))
 
     async def _wait_until_settled(
         self, username: str, password: str, timeout: float = 10.0
