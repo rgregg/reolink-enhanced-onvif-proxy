@@ -22,6 +22,11 @@ class CameraConfig:
     # Movement speed for position-feedback moves (1-64).
     # Lower = more precise but slower.
     move_speed: int = 15
+    # Optical magnification at calibrated zoom steps, e.g. {0: 1.0, 20: 2.68}.
+    # Used to turn Frigate's drag-to-zoom box into an exact zoom step.
+    # Without it, zoom is assumed geometric from 1x to max_zoom_magnification.
+    zoom_magnification: dict[int, float] = field(default_factory=dict)
+    max_zoom_magnification: float = 4.0
 
 
 @dataclass
@@ -47,6 +52,10 @@ def load_config(path: str | Path) -> ProxyConfig:
                 fov_pan_units=cam.get("fov_pan_units", 170),
                 fov_tilt_units=cam.get("fov_tilt_units", 95),
                 move_speed=cam.get("move_speed", 15),
+                zoom_magnification={
+                    int(k): float(v) for k, v in (cam.get("zoom_magnification") or {}).items()
+                },
+                max_zoom_magnification=float(cam.get("max_zoom_magnification", 4.0)),
             )
         )
 

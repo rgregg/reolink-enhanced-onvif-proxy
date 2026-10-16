@@ -9,6 +9,10 @@ cameras:
     # fov_pan_units: horizontal FOV in camera position units at full zoom-out (default: 170)
     # fov_tilt_units: vertical FOV in camera position units at full zoom-out (default: 95)
     # move_speed: movement speed for position-feedback moves, 1-64 (default: 15)
+    #   (fov_*/move_speed only apply to cameras without Set3DPos)
+    # zoom_magnification: optical magnification at calibrated zoom steps, used
+    #   for drag-to-zoom, e.g. {0: 1.0, 16: 2.12, 32: 6.14, 41: 12.7}
+    # max_zoom_magnification: magnification at max zoom when no curve is set (default: 4.0)
   - name: back_yard
     host: 192.168.1.11
     port: 80

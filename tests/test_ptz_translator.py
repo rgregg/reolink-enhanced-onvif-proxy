@@ -1,85 +1,121 @@
 """Tests for PTZ translation logic."""
 
+import pytest
+
 from reolink_onvif_proxy.ptz_translator import (
+    ZoomCurve,
     absolute_zoom_to_position,
+    center_box,
     continuous_move_to_op,
-    relative_move_to_3d_pos,
+    target_magnification,
 )
 
+W, H = 3840, 2160
 
-class TestRelativeMoveTo3DPos:
-    """Test RelativeMove → Set3DPos translation."""
 
-    def test_center_no_zoom(self):
-        """pan=0, tilt=0 should center the box (minimal movement)."""
-        result = relative_move_to_3d_pos(0, 0, 0, 3840, 2160)
-        # Box should be centered: pos_x = (3840 - boxW) / 2
-        assert result.pos_x == (3840 - result.pos_width) // 2
-        assert result.pos_y == (2160 - result.pos_height) // 2
-        # No zoom: box should be ~90% of frame
-        assert result.pos_width > 3000
-        assert result.pos_height > 1900
+def box_center(box):
+    return box.pos_x + box.pos_width / 2, box.pos_y + box.pos_height / 2
 
-    def test_pan_right(self):
-        """pan=1.0 should shift box to right side."""
-        result = relative_move_to_3d_pos(1.0, 0, 0, 3840, 2160)
-        center = relative_move_to_3d_pos(0, 0, 0, 3840, 2160)
-        assert result.pos_x > center.pos_x
 
-    def test_pan_left(self):
-        """pan=-1.0 should shift box to left side."""
-        result = relative_move_to_3d_pos(-1.0, 0, 0, 3840, 2160)
-        center = relative_move_to_3d_pos(0, 0, 0, 3840, 2160)
-        assert result.pos_x < center.pos_x
+class TestCenterBox:
+    """Test RelativeMove pan/tilt -> Set3DPos re-centering box."""
 
-    def test_tilt_up(self):
-        """tilt=1.0 should shift box upward (smaller posY)."""
-        result = relative_move_to_3d_pos(0, 1.0, 0, 3840, 2160)
-        center = relative_move_to_3d_pos(0, 0, 0, 3840, 2160)
-        assert result.pos_y < center.pos_y
+    def test_no_offset_is_noop(self):
+        assert center_box(0, 0, W, H) is None
 
-    def test_tilt_down(self):
-        """tilt=-1.0 should shift box downward (larger posY)."""
-        result = relative_move_to_3d_pos(0, -1.0, 0, 3840, 2160)
-        center = relative_move_to_3d_pos(0, 0, 0, 3840, 2160)
-        assert result.pos_y > center.pos_y
+    def test_right_uses_full_frame_box(self):
+        """Right/down targets keep a full-size box (no zoom) that runs off the edge."""
+        box = center_box(0.5, 0, W, H)
+        assert (box.pos_width, box.pos_height) == (W, H)
+        assert box_center(box) == (2880, 1080)
 
-    def test_zoom_in(self):
-        """Positive zoom should produce a smaller box."""
-        result = relative_move_to_3d_pos(0, 0, 0.5, 3840, 2160)
-        assert result.pos_width < 3840
-        assert result.pos_height < 2160
+    def test_down_uses_full_frame_box(self):
+        box = center_box(0, -0.5, W, H)
+        assert (box.pos_width, box.pos_height) == (W, H)
+        assert box_center(box) == (1920, 1620)
 
-    def test_zoom_out(self):
-        """Negative zoom should produce a larger box."""
-        result = relative_move_to_3d_pos(0, 0, -0.5, 3840, 2160)
-        assert result.pos_width > 3840
-        assert result.pos_height > 2160
+    def test_left_shrinks_box_to_stay_in_bounds(self):
+        """Camera ignores negative posX, so left targets get a smaller box."""
+        box = center_box(-0.5, 0, W, H)
+        assert box.pos_x == 0
+        assert box.pos_width == W // 2
+        assert box_center(box) == (960, 1080)
+
+    def test_up_left_keeps_aspect_and_center(self):
+        box = center_box(-0.5, 0.5, W, H)
+        assert (box.pos_x, box.pos_y) == (0, 0)
+        assert box.pos_width / box.pos_height == pytest.approx(W / H, rel=0.01)
+        assert box_center(box) == (960, 540)
+
+    def test_origin_never_negative(self):
+        for pan in (-1, -0.9, -0.3, 0.3, 1):
+            for tilt in (-1, -0.4, 0.4, 0.95, 1):
+                box = center_box(pan, tilt, W, H)
+                assert box.pos_x >= 0 and box.pos_y >= 0
+
+    def test_extreme_edge_uses_minimum_box(self):
+        box = center_box(-1.0, 0, W, H)
+        assert box.pos_width == int(W * 0.05)
 
     def test_clamping(self):
-        """Values beyond -1/1 should be clamped."""
-        result = relative_move_to_3d_pos(5.0, -5.0, 0, 3840, 2160)
-        assert result.pos_x >= 0
-        assert result.pos_y >= 0
+        assert box_center(center_box(5.0, 0, W, H)) == box_center(center_box(1.0, 0, W, H))
 
     def test_speed_mapping(self):
-        """Speed 1.0 should map to ~61, speed 0 to 1."""
-        result = relative_move_to_3d_pos(0, 0, 0, 3840, 2160, speed=1.0)
-        assert result.speed == 61
-        result = relative_move_to_3d_pos(0, 0, 0, 3840, 2160, speed=0.0)
-        assert result.speed == 1
-
-    def test_minimum_box_size(self):
-        """Even max zoom should not produce a box smaller than 100px."""
-        result = relative_move_to_3d_pos(0, 0, 1.0, 3840, 2160)
-        assert result.pos_width >= 100
-        assert result.pos_height >= 100
+        assert center_box(0.5, 0, W, H, speed=1.0).speed == 61
+        assert center_box(0.5, 0, W, H, speed=0.0).speed == 1
 
     def test_stream_dimensions_passed_through(self):
-        """Stream dimensions should be in the output."""
-        result = relative_move_to_3d_pos(0, 0, 0, 1920, 1080)
-        assert result.width == 1920
-        assert result.height == 1080
+        box = center_box(0.5, 0, 1920, 1080)
+        assert (box.width, box.height) == (1920, 1080)
+
+
+class TestTargetMagnification:
+    """Frigate drag-to-zoom sends the drawn box size as a frame fraction."""
+
+    def test_zoom_in_fills_frame_with_box(self):
+        assert target_magnification(1.0, 0.5) == pytest.approx(2.0)
+        assert target_magnification(2.0, 0.25) == pytest.approx(8.0)
+
+    def test_zoom_out_shrinks_view_to_box(self):
+        assert target_magnification(4.0, -0.5) == pytest.approx(2.0)
+
+    def test_no_zoom(self):
+        assert target_magnification(3.0, 0) == 3.0
+
+    def test_fraction_floor(self):
+        assert target_magnification(1.0, 0.001) == pytest.approx(100.0)
+
+
+class TestZoomCurve:
+    POINTS = {0: 1.0, 8: 1.42, 16: 2.12, 24: 3.45, 32: 6.14, 41: 12.7}
+
+    def test_calibrated_points_round_trip(self):
+        curve = ZoomCurve(0, 41, self.POINTS)
+        for step, mag in self.POINTS.items():
+            assert curve.magnification(step) == pytest.approx(mag)
+            assert curve.step_for(mag) == step
+
+    def test_interpolates_in_log_space(self):
+        curve = ZoomCurve(0, 41, {0: 1.0, 10: 4.0})
+        assert curve.magnification(5) == pytest.approx(2.0)
+        assert curve.step_for(2.0) == 5
+
+    def test_clamps_to_range(self):
+        curve = ZoomCurve(0, 41, self.POINTS)
+        assert curve.step_for(0.5) == 0
+        assert curve.step_for(50) == 41
+
+    def test_default_geometric_curve(self):
+        curve = ZoomCurve(0, 30, max_magnification=4.0)
+        assert curve.magnification(0) == pytest.approx(1.0)
+        assert curve.magnification(15) == pytest.approx(2.0)
+        assert curve.magnification(30) == pytest.approx(4.0)
+
+    def test_half_frame_drag_doubles_magnification(self):
+        curve = ZoomCurve(0, 41, self.POINTS)
+        start = 0
+        target = curve.step_for(target_magnification(curve.magnification(start), 0.5))
+        assert curve.magnification(target) == pytest.approx(2.0, rel=0.06)
 
 
 class TestContinuousMoveToOp:

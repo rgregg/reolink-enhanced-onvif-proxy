@@ -29,7 +29,7 @@ The proxy handles only PTZ control. Video streams (RTSP) still go directly from 
 
 ## Features
 
-- **RelativeMove with FOV** → translated to Reolink's `Set3DPos` (3D area zoom)
+- **RelativeMove with FOV** → re-centered with Reolink's `Set3DPos`, then an exact zoom step from a per-camera magnification curve
 - **AbsoluteMove zoom** → translated to `StartZoomFocus`
 - **ContinuousMove** → passed through to `PtzCtrl`
 - **Position reporting** → real pan/tilt/zoom from `GetPtzCurPos` and `GetZoomFocus`
@@ -109,7 +109,26 @@ cameras:
 
 ### RelativeMove Translation
 
-Frigate's autotracker and click-to-move send ONVIF `RelativeMove` commands with normalized FOV offsets (e.g., "move 0.3 right and 0.2 up within the current field of view"). The proxy translates this to Reolink's `Set3DPos` command — a single atomic operation that pans, tilts, and zooms the camera to frame a specified rectangle.
+Frigate's autotracker and click-to-move send ONVIF `RelativeMove` commands with normalized FOV offsets (e.g., "move 0.3 right and 0.2 up within the current field of view"). Drag-to-zoom adds a zoom value that is the drawn box's size as a fraction of the frame (positive = zoom in so the box fills the frame, negative = zoom out so the current view shrinks to the box).
+
+On cameras with `Set3DPos` the proxy does this in two steps:
+
+1. **Center** — `Set3DPos` with a frame-sized box centered on the target. The camera pans/tilts so the box center becomes the view center, accounting for its current zoom. The camera ignores boxes with a negative origin, so for targets left of or above center the box is shrunk until it fits (the camera zooms in a little as a side effect).
+2. **Zoom** — the camera's own box-to-zoom mapping is far weaker than the box implies (a half-frame box gives about 1.3x), so the proxy sets the zoom step directly: target magnification = current / box fraction, converted to a step with the camera's `zoom_magnification` curve. Pan-only moves restore the starting zoom step.
+
+The command returns immediately and `GetStatus` reports `MOVING` until both steps finish, so Frigate waits for the whole move.
+
+#### Calibrating zoom
+
+Magnification per zoom step is model-specific and non-linear. Measure it once (e.g. step through zoom positions, grab frames, and compare scale by feature matching) and set it per camera:
+
+```yaml
+    zoom_magnification: {0: 1.0, 8: 1.42, 16: 2.12, 24: 3.45, 32: 6.14, 41: 12.7}
+```
+
+Values between points are interpolated in log space. Without a curve the proxy assumes magnification grows geometrically from 1x to `max_zoom_magnification` (default 4.0) across the zoom range.
+
+Cameras without `Set3DPos` fall back to a position-feedback `ContinuousMove` (tuned with `fov_pan_units`/`fov_tilt_units`/`move_speed`), which is less accurate because the camera coasts after `Stop`.
 
 ### Position Reporting
 

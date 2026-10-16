@@ -1,8 +1,10 @@
 """ONVIF SOAP server — routes incoming SOAP requests to the appropriate handler."""
 
+import asyncio
 import hashlib
 import base64
 import logging
+import time
 from datetime import datetime, timezone
 
 from aiohttp import web
@@ -11,11 +13,13 @@ from lxml import etree
 from . import onvif_responses as responses
 from .config import CameraConfig
 from .ptz_translator import (
+    ZoomCurve,
     absolute_zoom_to_position,
+    center_box,
     continuous_move_to_op,
-    relative_move_to_3d_pos,
+    target_magnification,
 )
-from .reolink_api import ReolinkAPI
+from .reolink_api import ReolinkAPI, ZoomFocus
 from .state import CameraState
 
 logger = logging.getLogger(__name__)
@@ -120,6 +124,7 @@ class ONVIFServer:
         self.api = reolink_api
         self.state = CameraState()
         self._app: web.Application | None = None
+        self._action_task: asyncio.Task | None = None
 
     def create_app(self) -> web.Application:
         """Create the aiohttp web application."""
@@ -298,6 +303,7 @@ class ONVIFServer:
             )
 
         elif action == "ContinuousMove":
+            self._cancel_action()
             await self._handle_continuous_move(body, username, password)
             return responses.simple_response("tptz", "ContinuousMove")
 
@@ -306,15 +312,18 @@ class ONVIFServer:
             return responses.simple_response("tptz", "RelativeMove")
 
         elif action == "AbsoluteMove":
+            self._cancel_action()
             await self._handle_absolute_move(body, username, password)
             return responses.simple_response("tptz", "AbsoluteMove")
 
         elif action == "Stop":
+            self._cancel_action()
             await self.api.ptz_control(username, password, "Stop")
             self.state.move_status = self.state.move_status.IDLE
             return responses.simple_response("tptz", "Stop")
 
         elif action == "GotoPreset":
+            self._cancel_action()
             await self._handle_goto_preset(body, username, password)
             return responses.simple_response("tptz", "GotoPreset")
 
@@ -390,55 +399,119 @@ class ONVIFServer:
             self.config.name, pan, tilt, zoom, speed,
         )
 
-        has_zoom = abs(zoom) >= 0.01
-        if self.api.supports_3d_pos and has_zoom:
-            # Use Set3DPos when zoom is involved (atomic pan+tilt+zoom)
-            resolution = await self.api.get_stream_resolution(username, password)
-            params = relative_move_to_3d_pos(
-                pan=pan, tilt=tilt, zoom=zoom,
-                stream_width=resolution.width,
-                stream_height=resolution.height,
-                speed=speed,
-            )
+        if self.api.supports_3d_pos:
+            # Runs in the background so Frigate gets its response right away;
+            # GetStatus reports MOVING until every step has finished.
+            self._start_action(self._relative_move_3d(pan, tilt, zoom, speed, username, password))
+            return
+
+        # No Set3DPos: position-feedback ContinuousMove for pan/tilt
+        logger.debug("Camera %s: using position-feedback RelativeMove", self.config.name)
+        await self.api.relative_move_feedback(
+            username=username, password=password,
+            pan=pan, tilt=tilt, speed=speed,
+            fov_pan_units=self.config.fov_pan_units,
+            fov_tilt_units=self.config.fov_tilt_units,
+            move_speed=self.config.move_speed,
+        )
+        if abs(zoom) >= 0.01:
+            zf = await self.api.get_zoom_focus(username, password)
+            target = self._zoom_target(zf, zf.zoom_pos, zoom)
+            if target != zf.zoom_pos:
+                await self.api.set_zoom(username, password, target)
+
+        self.state.mark_moving()
+
+    async def _relative_move_3d(
+        self, pan: float, tilt: float, zoom: float, speed: float, username: str, password: str
+    ):
+        """Center on the requested point with Set3DPos, then set the exact zoom step.
+
+        Set3DPos centers accurately, but the zoom the camera picks for a box is
+        much weaker than the box size implies (a half-frame box gives ~1.3x on
+        a lake_view-class camera), and shrunken boxes for left/up targets zoom
+        in as a side effect. So the zoom step is always set explicitly after.
+        """
+        zf = await self.api.get_zoom_focus(username, password)
+        start_step = zf.zoom_pos
+
+        resolution = await self.api.get_stream_resolution(username, password)
+        box = center_box(pan, tilt, resolution.width, resolution.height, speed)
+        if box is not None:
             logger.info(
                 "Camera %s: Set3DPos posX=%d posY=%d posW=%d posH=%d (stream %dx%d)",
-                self.config.name, params.pos_x, params.pos_y,
-                params.pos_width, params.pos_height, params.width, params.height,
+                self.config.name, box.pos_x, box.pos_y,
+                box.pos_width, box.pos_height, box.width, box.height,
             )
             await self.api.set_3d_pos(
                 username=username, password=password,
-                pos_x=params.pos_x, pos_y=params.pos_y,
-                pos_width=params.pos_width, pos_height=params.pos_height,
-                stream_width=params.width, stream_height=params.height,
-                speed=params.speed,
+                pos_x=box.pos_x, pos_y=box.pos_y,
+                pos_width=box.pos_width, pos_height=box.pos_height,
+                stream_width=box.width, stream_height=box.height,
+                speed=box.speed,
             )
-        else:
-            # Use position-feedback ContinuousMove for pan/tilt
-            # and digital zoom via SetZoomFocus when zoom is requested
-            logger.debug("Camera %s: using position-feedback RelativeMove", self.config.name)
-            await self.api.relative_move_feedback(
-                username=username, password=password,
-                pan=pan, tilt=tilt, speed=speed,
-                fov_pan_units=self.config.fov_pan_units,
-                fov_tilt_units=self.config.fov_tilt_units,
-                move_speed=self.config.move_speed,
+            zf = await self._wait_until_settled(username, password)
+
+        target_step = self._zoom_target(zf, start_step, zoom)
+        if zf.zoom_pos != target_step:
+            logger.info(
+                "Camera %s: zoom %d -> %d (requested %.3f)",
+                self.config.name, zf.zoom_pos, target_step, zoom,
             )
+            await self.api.set_zoom(username, password, target_step)
+            await self._wait_until_settled(username, password)
 
-            # Apply digital zoom if requested
-            if has_zoom:
-                zoom_focus = await self.api.get_zoom_focus(username, password)
-                zoom_range = zoom_focus.zoom_max - zoom_focus.zoom_min
-                # zoom parameter is 0-1 where higher = more zoom in
-                target_zoom = zoom_focus.zoom_pos + int(zoom * zoom_range)
-                target_zoom = max(zoom_focus.zoom_min, min(zoom_focus.zoom_max, target_zoom))
-                logger.info(
-                    "Camera %s: digital zoom %d -> %d (range %d-%d)",
-                    self.config.name, zoom_focus.zoom_pos, target_zoom,
-                    zoom_focus.zoom_min, zoom_focus.zoom_max,
-                )
-                await self.api.set_zoom(username, password, target_zoom)
+    def _zoom_target(self, zf: ZoomFocus, start_step: int, zoom: float) -> int:
+        """Zoom step for a RelativeMove zoom value, starting from start_step."""
+        if abs(zoom) < 0.01 or zf.zoom_max <= zf.zoom_min:
+            return start_step
+        curve = ZoomCurve(
+            zf.zoom_min, zf.zoom_max,
+            points=self.config.zoom_magnification,
+            max_magnification=self.config.max_zoom_magnification,
+        )
+        return curve.step_for(target_magnification(curve.magnification(start_step), zoom))
 
-        self.state.mark_moving()
+    async def _wait_until_settled(
+        self, username: str, password: str, timeout: float = 10.0
+    ) -> ZoomFocus:
+        """Poll until pan/tilt/zoom stop changing; returns the final zoom state."""
+        deadline = time.monotonic() + timeout
+        started = time.monotonic()
+        last = None
+        stable = 0
+        zf = ZoomFocus()
+        while time.monotonic() < deadline:
+            await asyncio.sleep(0.3)
+            pos = await self.api.get_position(username, password)
+            zf = await self.api.get_zoom_focus(username, password)
+            current = (pos.pan, pos.tilt, zf.zoom_pos)
+            stable = stable + 1 if current == last else 0
+            last = current
+            # Give the camera time to start moving before trusting a still reading
+            if stable >= 2 and time.monotonic() - started > 1.0:
+                break
+        return zf
+
+    def _start_action(self, coro):
+        self._cancel_action()
+        self.state.begin_action()
+        task = asyncio.create_task(coro)
+        self._action_task = task
+        task.add_done_callback(self._action_done)
+
+    def _action_done(self, task: asyncio.Task):
+        if self._action_task is task:
+            self._action_task = None
+            self.state.end_action()
+        if not task.cancelled() and task.exception() is not None:
+            logger.error("Camera %s: move failed: %s", self.config.name, task.exception())
+
+    def _cancel_action(self):
+        task, self._action_task = self._action_task, None
+        if task is not None and not task.done():
+            task.cancel()
+        self.state.busy = False
 
     async def _handle_absolute_move(self, body: etree._Element, username: str, password: str):
         """Handle AbsoluteMove — translate zoom to StartZoomFocus."""

@@ -22,10 +22,21 @@ class CameraState:
     last_command_time: float = 0.0
     last_position_check: float = 0.0
     _prev_position: PtzPosition | None = None
+    # True while a multi-step move (e.g. Set3DPos then zoom) is still running
+    busy: bool = False
 
     def mark_moving(self):
         """Mark camera as moving after a command is sent."""
         self.move_status = MoveStatus.MOVING
+        self.last_command_time = time.monotonic()
+
+    def begin_action(self):
+        """Report MOVING until end_action(), whatever the position does."""
+        self.busy = True
+        self.mark_moving()
+
+    def end_action(self):
+        self.busy = False
         self.last_command_time = time.monotonic()
 
     def update_position(self, position: PtzPosition, zoom_focus: ZoomFocus):
@@ -35,6 +46,10 @@ class CameraState:
         self.position = position
         self.zoom_focus = zoom_focus
         self.last_position_check = time.monotonic()
+
+        if self.busy:
+            self.move_status = MoveStatus.MOVING
+            return
 
         if self.move_status == MoveStatus.MOVING:
             elapsed = time.monotonic() - self.last_command_time

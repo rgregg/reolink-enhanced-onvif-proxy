@@ -1,5 +1,6 @@
 """Translation logic for ONVIF RelativeMove to Reolink Set3DPos."""
 
+import math
 from dataclasses import dataclass
 
 
@@ -14,74 +15,44 @@ class Set3DPosParams:
     speed: int = 20
 
 
-def relative_move_to_3d_pos(
+def center_box(
     pan: float,
     tilt: float,
-    zoom: float,
     stream_width: int,
     stream_height: int,
     speed: float = 1.0,
-) -> Set3DPosParams:
-    """Convert ONVIF RelativeMove (FOV-relative) to Reolink Set3DPos params.
+    min_scale: float = 0.05,
+) -> Set3DPosParams | None:
+    """Build a Set3DPos box that re-centers the view on a point without zooming.
 
-    Args:
-        pan: -1.0 to 1.0 (left to right within FOV)
-        tilt: -1.0 to 1.0 (down to up within FOV)
-        zoom: relative zoom change (-1.0 to 1.0, positive = zoom in)
-        stream_width: stream resolution width (from Get3DPos)
-        stream_height: stream resolution height (from Get3DPos)
-        speed: ONVIF speed parameter (0.0 to 1.0)
+    ``pan``/``tilt`` are ONVIF FOV-space offsets (-1..1) of the target point from
+    the frame center, as Frigate sends for click-to-move (tilt up is positive).
 
-    Returns:
-        Set3DPosParams ready to send to the camera.
+    Set3DPos reframes the camera on the box's center, and the box size drives
+    the camera's own zoom choice. A full-frame box shifted so its center is on
+    the target pans without zooming, and the camera accepts a box running past
+    the right/bottom edge. It ignores boxes with a negative posX/posY, so for
+    targets left of or above center the box is shrunk until it fits; the camera
+    then zooms in somewhat, and the caller restores the zoom level afterwards.
+
+    Returns None when the target is the current center (nothing to do).
     """
-    # Clamp inputs
     pan = max(-1.0, min(1.0, pan))
     tilt = max(-1.0, min(1.0, tilt))
-    zoom = max(-1.0, min(1.0, zoom))
+    if abs(pan) < 0.01 and abs(tilt) < 0.01:
+        return None
 
-    # Set3DPos uses posX/posY as the TOP-LEFT corner of the target box,
-    # not the center. The camera reframes to show the specified rectangle.
-    # Full frame (0, 0, W, H) = no movement.
+    cx = stream_width / 2 * (1 + pan)
+    cy = stream_height / 2 * (1 - tilt)
 
-    # Box size determines zoom level
-    # For pan/tilt-only moves (no zoom), use a box slightly smaller than full frame.
-    # A full-frame box (0,0,W,H) means "no change" — the box must be smaller
-    # and offset to tell the camera where to reframe.
-    # We use 90% of frame size for pan/tilt-only moves so the camera
-    # repositions without significant zoom change.
-    if abs(zoom) < 0.01:
-        box_width = int(stream_width * 0.9)
-        box_height = int(stream_height * 0.9)
-    else:
-        # Scale factor: zoom=1.0 → box is 10% of frame (10x zoom)
-        # zoom=-1.0 → box is full frame (1x zoom / zoom out)
-        # zoom=0.5 → box is ~55% of frame
-        scale = 1.0 - (zoom * 0.9)  # range: 0.1 to 1.9
-        scale = max(0.1, min(2.0, scale))
-        box_width = int(stream_width * scale)
-        box_height = int(stream_height * scale)
+    # Largest frame-aspect box centered on (cx, cy) with a non-negative origin
+    scale = min(1.0, 2 * cx / stream_width, 2 * cy / stream_height)
+    scale = max(min_scale, scale)
+    box_width = int(stream_width * scale)
+    box_height = int(stream_height * scale)
 
-    # Ensure minimum box size
-    box_width = max(100, box_width)
-    box_height = max(100, box_height)
-
-    # Convert relative offset to the top-left corner of the target box.
-    # pan=0,tilt=0 → box centered on frame → top-left at (W/2 - boxW/2, H/2 - boxH/2)
-    # pan=1.0 → box shifted fully right → top-left at (W - boxW, H/2 - boxH/2)
-    # pan=-1.0 → box shifted fully left → top-left at (0, H/2 - boxH/2)
-    center_x = (stream_width / 2) + (pan * stream_width / 2)
-    center_y = (stream_height / 2) - (tilt * stream_height / 2)
-
-    pos_x = int(center_x - box_width / 2)
-    pos_y = int(center_y - box_height / 2)
-
-    # Clamp so the box stays within frame bounds
-    pos_x = max(0, min(stream_width - box_width, pos_x))
-    pos_y = max(0, min(stream_height - box_height, pos_y))
-
-    # Map ONVIF speed (0-1) to Reolink speed (1-64)
-    reolink_speed = max(1, min(64, int(speed * 60) + 1))
+    pos_x = max(0, int(cx - box_width / 2))
+    pos_y = max(0, int(cy - box_height / 2))
 
     return Set3DPosParams(
         pos_x=pos_x,
@@ -90,8 +61,77 @@ def relative_move_to_3d_pos(
         pos_height=box_height,
         width=stream_width,
         height=stream_height,
-        speed=reolink_speed,
+        speed=max(1, min(64, int(speed * 60) + 1)),
     )
+
+
+def target_magnification(current_mag: float, zoom: float) -> float:
+    """Magnification Frigate asks for with a RelativeMove zoom value.
+
+    Frigate's drag-to-zoom sends the drawn box's size as a fraction of the
+    frame (0.01..1). Positive means "zoom so the box fills the frame"; negative
+    (box drawn right-to-left) means "zoom out so the current view shrinks to
+    the box size".
+    """
+    fraction = max(0.01, min(1.0, abs(zoom)))
+    if zoom > 0:
+        return current_mag / fraction
+    if zoom < 0:
+        return current_mag * fraction
+    return current_mag
+
+
+class ZoomCurve:
+    """Maps camera zoom steps to optical magnification (1.0 at the widest step).
+
+    Built from calibration points ``{step: magnification}``; values between
+    points are interpolated in log space. Without calibration points, assumes
+    magnification grows geometrically from 1x at ``zoom_min`` to
+    ``max_magnification`` at ``zoom_max``.
+    """
+
+    def __init__(
+        self,
+        zoom_min: int,
+        zoom_max: int,
+        points: dict[int, float] | None = None,
+        max_magnification: float = 4.0,
+    ):
+        self.zoom_min = zoom_min
+        self.zoom_max = zoom_max
+        if points:
+            pts = sorted((int(k), float(v)) for k, v in points.items())
+        else:
+            pts = [(zoom_min, 1.0), (zoom_max, max_magnification)]
+        self._steps = [p[0] for p in pts]
+        self._logs = [math.log(max(p[1], 1e-6)) for p in pts]
+
+    def magnification(self, step: float) -> float:
+        return math.exp(self._interp(step, self._steps, self._logs))
+
+    def step_for(self, magnification: float) -> int:
+        """Nearest zoom step for a magnification, clamped to the camera range."""
+        log_mag = math.log(max(magnification, 1e-6))
+        if self._logs[0] <= self._logs[-1]:
+            step = self._interp(log_mag, self._logs, self._steps)
+        else:
+            step = self._interp(log_mag, self._logs[::-1], self._steps[::-1])
+        return max(self.zoom_min, min(self.zoom_max, round(step)))
+
+    @staticmethod
+    def _interp(x: float, xs: list[float], ys: list[float]) -> float:
+        if len(xs) == 1:
+            return ys[0]
+        # Clamp to the calibrated range rather than extrapolating
+        if x <= xs[0]:
+            return ys[0]
+        if x >= xs[-1]:
+            return ys[-1]
+        for i in range(1, len(xs)):
+            if x <= xs[i]:
+                t = (x - xs[i - 1]) / (xs[i] - xs[i - 1])
+                return ys[i - 1] + t * (ys[i] - ys[i - 1])
+        return ys[-1]
 
 
 def continuous_move_to_op(pan_velocity: float, tilt_velocity: float, zoom_velocity: float) -> tuple[str, int]:
